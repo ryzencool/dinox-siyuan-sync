@@ -1,7 +1,7 @@
 /**
  * Copyright (c) 2023 frostime. All rights reserved.
  * https://github.com/frostime/sy-plugin-template-vite
- * 
+ *
  * See API Document in [API.md](https://github.com/siyuan-note/siyuan/blob/master/API.md)
  * API 文档见 [API_zh_CN.md](https://github.com/siyuan-note/siyuan/blob/master/API_zh_CN.md)
  */
@@ -140,6 +140,15 @@ export async function getIDsByHPath(notebook: NotebookId, path: string): Promise
     let url = '/api/filetree/getIDsByHPath';
     return request(url, data);
 }
+
+export async function getPathByID( id: string): Promise<string> {
+    let data = {
+        id: id
+    };
+    let url = '/api/filetree/getPathByID';
+    return request(url, data);
+}
+
 
 // **************************************** Asset Files ****************************************
 
@@ -338,8 +347,8 @@ export async function getFile(path: string): Promise<any> {
 
 /**
  * fetchPost will secretly convert data into json, this func merely return Blob
- * @param endpoint 
- * @returns 
+ * @param endpoint
+ * @returns
  */
 export const getFileBlob = async (path: string): Promise<Blob | null> => {
     const endpoint = '/api/file/getFile'

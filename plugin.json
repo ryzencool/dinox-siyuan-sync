@@ -1,8 +1,8 @@
 {
-  "name": "plugin-sample-vite-svelte",
-  "author": "frostime",
-  "url": "https://github.com/siyuan-note/plugin-sample-vite-svelte",
-  "version": "0.3.5",
+  "name": "dinox-siyuan-sync",
+  "author": "zmy",
+  "url": "https://github.com/ryzencool/dinox-siyuan-sync",
+  "version": "0.3.9",
   "minAppVersion": "3.0.12",
   "backends": [
     "windows",
@@ -20,12 +20,12 @@
     "desktop-window"
   ],
   "displayName": {
-    "en_US": "Plugin sample with vite and svelte",
-    "zh_CN": "插件样例 vite + svelte 版"
+    "en_US": "Dinox Sync",
+    "zh_CN": "Dinox 同步"
   },
   "description": {
-    "en_US": "SiYuan plugin sample with vite and svelte",
-    "zh_CN": "使用 vite 和 svelte 开发的思源插件样例"
+    "en_US": "Synchronize notes from Dinox to SiYuan",
+    "zh_CN": "从 Dinox 同步笔记到思源"
   },
   "readme": {
     "en_US": "README.md",

@@ -48,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      # Build for production, 这一步会生成一个 package.zip
+      # Build for production, 这一步会生成一个 dinox-siyuan-sync-0.3.7.zip
       - name: Build for production
         run: pnpm build
 
@@ -57,6 +57,6 @@ jobs:
         with:
           allowUpdates: true
           artifactErrorsFailBuild: true
-          artifacts: "package.zip"
+          artifacts: "dinox-siyuan-sync-0.3.7.zip"
           token: ${{ secrets.GITHUB_TOKEN }}
           prerelease: true
