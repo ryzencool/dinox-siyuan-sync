@@ -107,7 +107,7 @@ export default defineConfig({
                         zipPack({
                             inDir: './dist',
                             outDir: './',
-                            outFileName: 'dinox-siyuan-sync-0.3.8.zip'
+                            outFileName: 'package.zip'
                         })
                     ]
                 )

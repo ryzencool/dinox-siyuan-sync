@@ -14,3 +14,4 @@
 2. 在插件的设置页面中填写上述的 notebook ID，以及 Dinox 的 API Key
 3. 点击同步按钮即可
 
+
