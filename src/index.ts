@@ -6,7 +6,8 @@ import {
     getFrontend,
     IModel,
     ICard,
-    ICardData
+    ICardData,
+    Dialog
 } from "siyuan";
 import "@/index.scss";
 
@@ -14,7 +15,15 @@ import "@/index.scss";
 
 import {SettingUtils} from "./libs/setting-utils";
 import axios from "axios";
-import {createDocWithMd, getIDsByHPath, getPathByID, removeDoc} from "@/api";
+import {
+    createDocWithMd,
+    exportMdContent,
+    getBlockByID,
+    getBlockKramdown,
+    getIDsByHPath,
+    getPathByID,
+    removeDoc
+} from "@/api";
 
 const STORAGE_NAME = "dinox_sync";
 
@@ -27,7 +36,7 @@ tags:
     - #{{.}}#
 {{/tags}}
 网页链接：
-录音: [下载]({{audioUrl}})
+录音：[下载]({{audioUrl}})
 创建时间：{{createTime}}
 更新时间：{{updateTime}}
 ---
@@ -61,7 +70,98 @@ interface DayNote {
     notes: Note[];
 }
 
+interface ICallout {
+    id: string;
+    icon: string;
+    title?: string;
+
+    bg?: {
+        light: string;
+        dark: string;
+    };
+    box?: {
+        light: string;
+        dark: string;
+    };
+
+    hide?: boolean;
+    // order?: number;
+    custom?: boolean;
+    slash?: {
+        big?: boolean;
+        small?: boolean;
+    }
+}
+
+function createCalloutButton(selectid: BlockId, callout: ICallout): HTMLButtonElement{
+    let button = document.createElement("button")
+    // let title = callout.title;
+    button.className = "b3-menu__item"
+    button.setAttribute("data-node-id", selectid)
+    let name =  'b';
+    button.setAttribute("custom-attr-name", name)
+    button.setAttribute("custom-attr-value", callout.id);
+    button.innerHTML = `<span class="b3-menu__label">${callout.icon}${"点击"}</span>`
+    return button
+}
+
+
+
 export default class PluginSample extends Plugin {
+
+    private blockIconEventBindThis = this.blockIconEvent.bind(this);
+
+    private async  blockIconEvent({ detail }: any) {
+        let menu: Menu = detail.menu;
+
+        const root = detail.blockElements[0]
+        const selectid = root.getAttribute("data-node-id") as string
+
+
+
+        menu.addItem({
+            icon: "iconInfo",
+            label: "同步到 Dinox",
+            click: async () => {
+                const uuidPattern = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
+
+                const block = await getBlockByID(selectid)
+                console.log(block)
+
+                const uuids = block.markdown.match(uuidPattern)[0];
+                const rootId = block.root_id
+                const result = await exportMdContent(rootId)
+                const arr = result.content.split("---")
+                const content = arr.slice(2, arr.length).join("")
+
+                // 有了 id 和 content 这个时候可以更新回到 dinox 了
+                try {
+                    const response = await axios.post('https://dinoai.chatgo.pro/openapi/updateNote', {
+                        noteId: uuids,
+                        contentMd: content
+                    }, {
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': this.settingUtils.get("token")
+                        }
+                    });
+
+                    if (response.status === 200) {
+                        showMessage("同步成功");
+                    } else {
+                        showMessage("同步失败");
+                    }
+                } catch (error) {
+                    console.error("同步失败：", error);
+                    showMessage("同步失败：" + error.message);
+                }
+
+                console.log(content)
+
+            }
+        });
+    }
+
 
     customTab: () => IModel;
     private isMobile: boolean;
@@ -71,6 +171,9 @@ export default class PluginSample extends Plugin {
         this.data[STORAGE_NAME] = {template: TEMPLATE, lastSyncTime: "1900-01-01 00:00:00", token: "", notebookId: ""};
 
         console.log("loading plugin-sample", this.i18n);
+        this.eventBus.on("click-blockicon", async (event) => {
+            await this.blockIconEventBindThis(event);
+        });
 
         const frontEnd = getFrontend();
         this.isMobile = frontEnd === "mobile" || frontEnd === "browser-mobile";
@@ -133,6 +236,34 @@ export default class PluginSample extends Plugin {
             dockCallback: (element: HTMLElement) => {
                 console.log(element, "dockCallback");
             },
+        });
+
+        this.addCommand({
+            langKey: "processSelectedText",
+            hotkey: "ctrl+shift+p",
+            callback: () => {
+                this.processSelectedText();
+            },
+            editorCallback: (protyle: any) => {
+                const selection = window.getSelection().toString();
+                if (selection) {
+                    this.processSelectedText();
+                }
+            },
+        });
+
+        this.eventBus.on("click-editortitleicon", () => {
+            const selection = window.getSelection().toString();
+            if (selection) {
+                const menu = new Menu("processTextMenu");
+                menu.addItem({
+                    icon: "iconSettings",
+                    label: "处理选中文本",
+                    click: () => {
+                        this.processSelectedText();
+                    }
+                });
+            }
         });
 
         this.settingUtils = new SettingUtils({
@@ -205,6 +336,8 @@ export default class PluginSample extends Plugin {
             console.error("Error loading settings storage, probably empty config json:", error);
         }
 
+
+
     }
 
     onLayoutReady() {
@@ -255,7 +388,7 @@ export default class PluginSample extends Plugin {
             lastSyncTime = dataJson["dinox_last_sync_time"]
         }
         // 获取上一次同步的时间
-        console.log("上次时间:", lastSyncTime)
+        console.log("上次时间：", lastSyncTime)
         const startSyncTime = formatDate(new Date())
 
         if (data == null) {
@@ -366,7 +499,7 @@ export default class PluginSample extends Plugin {
         });
         menu.addItem({
             icon: "iconInfo",
-            label: "同步",
+            label: "同步 12",
             accelerator: this.commands[0].customHotkey,
             click: () => {
                 this.fetchData();
@@ -395,5 +528,29 @@ export default class PluginSample extends Plugin {
                 isLeft: true,
             });
         }
+    }
+
+    private async processSelectedText() {
+        const selection = window.getSelection().toString();
+        if (!selection) {
+            showMessage("请先选择文本");
+            return;
+        }
+
+        console.log("选中的文本：", selection);
+
+        const dialog = new Dialog({
+            title: "选中的文本",
+            content: `<div class="b3-dialog__content">
+                        <div class="fn__flex-column">
+                            <div class="fn__flex">
+                                <div>${selection}</div>
+                            </div>
+                        </div>
+                    </div>`,
+            width: "500px",
+        });
+
+        // 你可以在这里添加更多的处理逻辑
     }
 }
