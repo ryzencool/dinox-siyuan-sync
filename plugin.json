@@ -2,7 +2,7 @@
   "name": "dinox-siyuan-sync",
   "author": "Shanks",
   "url": "https://github.com/ryzencool/dinox-siyuan-sync",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "minAppVersion": "3.0.12",
   "backends": [
     "windows",
