@@ -147,16 +147,23 @@ export default class PluginSample extends Plugin {
                     });
 
                     if (response.status === 200) {
-                        showMessage("同步成功");
+                        const startSyncTime = formatDate(new Date())
+                        localStorage.setItem("dinox_last_sync_time", startSyncTime)
+
+                        await this.saveData("data.json", JSON.stringify({
+                            "dinox_last_sync_time": startSyncTime
+                        }))
+                        // 更新时间
+                        new Notification("同步成功")
+
                     } else {
-                        showMessage("同步失败");
+                        new Notification("同步失败")
+
                     }
                 } catch (error) {
-                    console.error("同步失败：", error);
-                    showMessage("同步失败：" + error.message);
-                }
+                    new Notification("同步失败：" + error.message)
 
-                console.log(content)
+                }
 
             }
         });
