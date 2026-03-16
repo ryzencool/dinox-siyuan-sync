@@ -2,7 +2,7 @@
   "name": "dinox-siyuan-sync",
   "author": "Shanks",
   "url": "https://github.com/ryzencool/dinox-siyuan-sync",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "minAppVersion": "3.0.12",
   "backends": [
     "windows",
@@ -20,14 +20,17 @@
     "desktop-window"
   ],
   "displayName": {
+    "default": "Dinox Sync",
     "en_US": "Dinox Sync",
     "zh_CN": "Dinox 同步"
   },
   "description": {
+    "default": "Synchronize notes from Dinox to SiYuan",
     "en_US": "Synchronize notes from Dinox to SiYuan",
     "zh_CN": "从 Dinox 同步笔记到思源"
   },
   "readme": {
+    "default": "README.md",
     "en_US": "README.md",
     "zh_CN": "README_zh_CN.md"
   },

@@ -4,731 +4,249 @@ import {
   confirm,
   Menu,
   getFrontend,
-  IModel,
-  ICard,
-  ICardData,
+  Setting,
 } from "siyuan";
 import "@/index.scss";
 
-import { SettingUtils } from "./libs/setting-utils";
-import axios from "axios";
 import {
   createDocWithMd,
   exportMdContent,
   exportMdContentWithoutFrontmatterAndTitle,
+  getBlockAttrs,
   getBlockByID,
   getIDsByHPath,
   getPathByID,
   removeDoc,
   setBlockAttrs,
-  getBlockAttrs,
+  sql,
   updateBlock,
 } from "@/api";
+import {
+  API_BASE_URL,
+  DEFAULT_LAST_SYNC_TIME,
+  DEFAULT_TEMPLATE_TEXT,
+  SETTINGS_STORAGE_FILE,
+  STORAGE_NAME,
+  SYNC_STATE_NAME,
+} from "./constants";
+import { createDinoxNote, fetchNotesFromApi, updateDinoxNote } from "./dinox-api";
+import {
+  extractAllTagsFromMarkdown,
+  extractFrontmatterScalar,
+  mergeFrontmatter,
+  parseFrontmatterRecord,
+  splitFrontmatter,
+} from "./markdown";
+import { SettingUtils } from "./libs/setting-utils";
+import type {
+  DailyNoteChangeSet,
+  DinoPluginSettings,
+  LocalDocInfo,
+  Note,
+  SyncState,
+} from "./types/plugin";
+import {
+  categorizeType,
+  firstZettelBoxName,
+  formatDate,
+  getErrorMessage,
+  normalizeDinoxDateTime,
+  parseDate,
+  resolveBaseHPath,
+  sanitizeFilename,
+  sanitizeFolderSegment,
+} from "./utils";
 
-const STORAGE_NAME = "dinox_sync";
-
-// --- Interfaces ---
-interface Note {
-  title: string;
-  createTime: string;
-  content: string;
-  noteId: string;
-  tags: string[];
-  isDel: boolean;
-  isAudio?: boolean;
-  audioUrl?: string;
-  type: string;
-  zettelBoxes?: string[];
-}
-
-interface DayNote {
-  date: string;
-  notes: Note[];
-}
-
-interface GetNoteApiResult {
-  code: string;
-  msg?: string;
-  data: DayNote[];
-}
-
-interface DinoPluginSettings {
-  token: string;
-  isAutoSync: boolean;
-  notebookId: string;
-  filenameFormat: "noteId" | "title" | "time";
-  fileLayout: "flat" | "nested";
-  ignoreSyncKey: string;
-  preserveKeys: string;
-  smartSyncHotkey: string;
-  batchSyncHotkey: string;
-}
-
-// --- Constants ---
 const DEFAULT_SETTINGS: DinoPluginSettings = {
   token: "",
   isAutoSync: false,
   notebookId: "",
+  basePath: "Dinox Sync",
+  typeFolders: {
+    enabled: true,
+    note: "note",
+    material: "material",
+  },
+  zettelBoxFolders: {
+    enabled: false,
+  },
+  template: DEFAULT_TEMPLATE_TEXT,
   filenameFormat: "noteId",
+  filenameTemplate: "{{title}} ({{createDate}})",
   fileLayout: "nested",
   ignoreSyncKey: "ignore_sync",
   preserveKeys: "",
-  smartSyncHotkey: "⌘+⇧+S",
-  batchSyncHotkey: "⌘+⇧+D",
+  syncAllHotkey: "",
+  syncCurrentHotkey: "",
+  createNoteHotkey: "",
+  dailyNotes: {
+    enabled: false,
+    notebookId: "",
+    basePath: "Daily Notes/Dinox",
+    heading: "## Dinox Notes",
+    insertTo: "bottom",
+    createIfMissing: true,
+    includePreview: false,
+  },
 };
 
-const API_BASE_URL = "https://dinoai.chatgo.pro";
-const API_BASE_URL_AI = "https://aisdk.chatgo.pro";
-
-function formatDate(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
-  const seconds = String(date.getSeconds()).padStart(2, "0");
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-}
-
-// Keep sanitization for robustness
-function sanitizeFilename(name: string): string {
-  if (!name) return "Untitled";
-  let sanitized = name.replace(/[\\/:*?"<>|#^\[\]]/g, "-");
-  sanitized = sanitized.replace(/[\s-]+/g, "-");
-  sanitized = sanitized.trim().replace(/^-+|-+$/g, "");
-  sanitized = sanitized.substring(0, 100);
-  if (sanitized === "." || sanitized === "..") return "Untitled";
-  return sanitized || "Untitled";
-}
-
-interface ICallout {
-  id: string;
-  icon: string;
-  title?: string;
-
-  bg?: {
-    light: string;
-    dark: string;
-  };
-  box?: {
-    light: string;
-    dark: string;
-  };
-
-  hide?: boolean;
-  // order?: number;
-  custom?: boolean;
-  slash?: {
-    big?: boolean;
-    small?: boolean;
-  };
-}
-
-function createCalloutButton(
-  selectid: BlockId,
-  callout: ICallout
-): HTMLButtonElement {
-  let button = document.createElement("button");
-  // let title = callout.title;
-  button.className = "b3-menu__item";
-  button.setAttribute("data-node-id", selectid);
-  let name = "b";
-  button.setAttribute("custom-attr-name", name);
-  button.setAttribute("custom-attr-value", callout.id);
-  button.innerHTML = `<span class="b3-menu__label">${
-    callout.icon
-  }${"点击"}</span>`;
-  return button;
-}
-
-export default class PluginSample extends Plugin {
-  private editorTitleIconEventBindThis = this.editorTitleIconEvent.bind(this);
-  private isSyncing: boolean = false;
-  private settings: DinoPluginSettings;
-
-  private async editorTitleIconEvent({ detail }: any) {
-    try {
-      // 检查事件结构是否正确
-      if (!detail || !detail.menu) {
-        console.warn("Dinox: 编辑器标题栏事件结构不正确", detail);
-        return;
-      }
-
-      const menu: Menu = detail.menu;
-      
-      // 获取当前文档的 ID - 编辑器标题栏事件中通常通过 detail.data 获取
-      let docId: string | null = null;
-      
-      if (detail.data && detail.data.id) {
-        docId = detail.data.id;
-      } else if (detail.protyle && detail.protyle.block && detail.protyle.block.rootID) {
-        docId = detail.protyle.block.rootID;
-      } else {
-        console.warn("Dinox: 无法获取文档 ID", detail);
-        // 如果无法获取文档 ID，仍然显示菜单项，但在点击时提示用户
-      }
-
-      menu.addItem({
-        icon: "iconCloudSync",
-        label: "智能同步到 Dinox",
-        click: async () => {
-          if (!docId) {
-            showMessage("无法获取当前文档 ID，请重试", 3000, "error");
-            return;
-          }
-          await this.smartSyncDocToDinox(docId);
-        },
-      });
-    } catch (error) {
-      console.error("Dinox: 处理编辑器标题栏事件时出错：", error);
-      showMessage("处理菜单事件时出错：" + error.message, 3000, "error");
-    }
-  }
-
-  private async smartSyncDocToDinox(docId: string) {
-    try {
-      // 验证输入参数
-      if (!docId) {
-        showMessage("文档 ID 无效", 3000, "error");
-        return;
-      }
-
-      // 检查设置
-      if (!this.settings.token) {
-        showMessage("请先在设置中配置 Dinox Token", 3000, "error");
-        return;
-      }
-
-      // 获取文档 attributes 检查是否已关联 Dinox 笔记
-      
-      const attrs = await getBlockAttrs(docId);
-      console.log("doc attrs", attrs);
-      const existingNoteId = attrs["custom-dinox-note-id"];
-
-      console.log("是否存在", existingNoteId);
-      if (existingNoteId) {
-        // 已关联，执行更新操作
-        console.log(`文档已关联到 Dinox 笔记 (ID: ${existingNoteId})，执行更新操作`);
-        await this.updateExistingNoteInDinox(docId, existingNoteId);
-      } else {
-        // 未关联，执行创建操作
-        console.log("文档未关联到 Dinox 笔记，执行创建操作");
-        await this.createNewNoteInDinox(docId);
-      }
-    } catch (error) {
-      console.error("Dinox: 智能同步失败：", error);
-      const errorMsg = error.response?.data?.msg || error.message || "网络错误";
-      showMessage(`智能同步失败：${errorMsg}`, 5000, "error");
-    }
-  }
-
-  private async updateExistingNoteInDinox(docId: string, noteId: string) {
-    try {
-      // 导出文档内容（去掉 frontmatter 和标题，只有正文）
-      const result = await exportMdContentWithoutFrontmatterAndTitle(docId);
-      console.log("result", result);
-      
-      if (!result || !result.content) {
-        showMessage("获取文档内容失败", 3000, "error");
-        return;
-      }
-
-      const content = result.content;
-      showMessage("正在更新到 Dinox...", 0, "info");
-
-      const response = await axios.post(
-        `${API_BASE_URL_AI}/api/openapi/updateNote`,
-        {
-          noteId: noteId,
-          contentMd: content,
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: this.settings.token,
-          },
-          timeout: 30000, // 30 秒超时
-        }
-      );
-
-      if (response.status === 200 && response.data.code === "000000") {
-        showMessage(`更新到 Dinox 成功 (ID: ${noteId.substring(0, 8)}...)`, 3000, "info");
-      } else {
-        const errorMsg = response.data?.msg || "未知错误";
-        showMessage(`更新失败：${errorMsg}`, 5000, "error");
-      }
-    } catch (error) {
-      console.error("Dinox: 更新笔记失败：", error);
-      throw error;
-    }
-  }
-
-  private async createNewNoteInDinox(docId: string) {
-    try {
-      // 导出文档内容（去掉 frontmatter 和标题，只包含正文）
-      const result = await exportMdContentWithoutFrontmatterAndTitle(docId);
-      if (!result || !result.content) {
-        showMessage("获取文档内容失败", 3000, "error");
-        return;
-      }
-
-      const content = result.content;
-
-      // 获取文档块信息以获取标题
-      const block = await getBlockByID(docId);
-      const title = block.content || "新建笔记";
-
-      showMessage("正在创建到 Dinox...", 0, "info");
-
-      const response = await axios.post(
-        `${API_BASE_URL_AI}/api/openapi/createNote`,
-        {
-          content: content,
-          title: title,
-          tags: [],
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: this.settings.token,
-          },
-          timeout: 30000, // 30 秒超时
-        }
-      );
-
-      if (response.status === 200 && response.data.code === "000000") {
-        const noteId = response.data.data.noteId;
-
-        // 设置文档 attributes 存储 noteId 和其他元数据
-        const attrs: { [key: string]: string } = {
-          "custom-dinox-note-id": noteId,
-          "custom-dinox-type": "note",
-          "custom-dinox-created-at": new Date().toISOString(),
-        };
-
-        await setBlockAttrs(docId, attrs);
-
-        showMessage(
-          `创建到 Dinox 成功！笔记 ID: ${noteId.substring(0, 8)}...`,
-          5000,
-          "info"
-        );
-      } else {
-        const errorMsg = response.data?.msg || "未知错误";
-        showMessage(`创建失败：${errorMsg}`, 5000, "error");
-      }
-    } catch (error) {
-      console.error("Dinox: 创建笔记失败：", error);
-      throw error;
-    }
-  }
-
-  private async getCurrentDocId(): Promise<string | null> {
-    try {
-      // 获取当前聚焦的编辑器
-      const protyles = document.querySelectorAll('.protyle:not(.fn__none)');
-      if (protyles.length > 0) {
-        const protyle = protyles[protyles.length - 1]; // 获取最后一个可见的编辑器
-        const protyleElement = protyle.querySelector('.protyle-wysiwyg');
-        if (protyleElement) {
-          const rootBlock = protyleElement.querySelector('[data-node-id]');
-          if (rootBlock) {
-            return rootBlock.getAttribute('data-node-id');
-          }
-        }
-      }
-      
-      // 备用方法：通过 URL 获取
-      const pathMatch = location.hash.match(/#(\d{14}-[a-z0-9]{7})/);
-      if (pathMatch) {
-        return pathMatch[1];
-      }
-      
-      return null;
-    } catch (error) {
-      console.error('获取当前文档 ID 失败：', error);
-      return null;
-    }
-  }
-
-  private createHotkeyInput(currentValue: string, onchange: (value: string) => void): HTMLElement {
-    // 创建容器
-    const container = document.createElement('div');
-    container.className = 'fn__flex fn__flex-center';
-    container.style.gap = '8px';
-
-    // 创建输入框
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'b3-text-field fn__flex-center';
-    input.style.width = '160px';
-    input.value = currentValue || '';
-    input.placeholder = '点击并按下快捷键...';
-    input.readOnly = true; // 设置为只读，防止直接输入
-
-    // 创建清除按钮
-    const clearButton = document.createElement('button');
-    clearButton.className = 'b3-button b3-button--outline';
-    clearButton.innerHTML = '✕';
-    clearButton.title = '清除快捷键';
-    clearButton.style.width = '32px';
-    clearButton.style.height = '32px';
-    clearButton.style.padding = '0';
-    clearButton.style.fontSize = '14px';
-
-    // 清除按钮点击事件
-    clearButton.addEventListener('click', (e) => {
-      e.preventDefault();
-      input.value = '';
-      if (onchange) {
-        onchange('');
-      }
-    });
-
-    // 键盘事件监听
-    const handleKeyDown = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-
-      // 忽略单独的修饰键
-      if (['Control', 'Shift', 'Alt', 'Meta', 'Cmd'].includes(e.key)) {
-        return;
-      }
-
-      // ESC 键清除快捷键
-      if (e.key === 'Escape') {
-        input.value = '';
-        input.blur();
-        if (onchange) {
-          onchange('');
-        }
-        return;
-      }
-
-      // 构建快捷键字符串
-      const parts: string[] = [];
-      
-      // 检测操作系统并使用相应的修饰键符号
-      const isMac = /Mac|iPod|iPhone|iPad/.test(navigator.platform);
-      
-      if (e.metaKey || e.ctrlKey) {
-        parts.push(isMac ? '⌘' : 'Ctrl');
-      }
-      if (e.altKey) {
-        parts.push(isMac ? '⌥' : 'Alt');
-      }
-      if (e.shiftKey) {
-        parts.push(isMac ? '⇧' : 'Shift');
-      }
-
-      // 添加主要按键
-      let key = e.key;
-      if (key === ' ') {
-        key = 'Space';
-      } else if (key.length === 1) {
-        key = key.toUpperCase();
-      }
-      parts.push(key);
-
-      const hotkeyString = parts.join('+');
-      input.value = hotkeyString;
-      
-      if (onchange) {
-        onchange(hotkeyString);
-      }
-    };
-
-    // 焦点事件处理
-    const handleFocus = () => {
-      input.placeholder = '按下快捷键组合...';
-      input.style.backgroundColor = '#f0f8ff';
-      input.style.border = '1px solid #4285f4';
-    };
-
-    const handleBlur = () => {
-      input.placeholder = '点击并按下快捷键...';
-      input.style.backgroundColor = '';
-      input.style.border = '';
-    };
-
-    // 合并键盘事件处理
-    const handleKeyDownWithPrevention = (e: KeyboardEvent) => {
-      // 阻止回车键确认
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        return;
-      }
-      
-      // 处理快捷键录制
-      handleKeyDown(e);
-    };
-
-    input.addEventListener('keydown', handleKeyDownWithPrevention);
-    input.addEventListener('focus', handleFocus);
-    input.addEventListener('blur', handleBlur);
-
-    // 将输入框和清除按钮添加到容器
-    container.appendChild(input);
-    container.appendChild(clearButton);
-
-    // 为容器添加一个自定义属性，以便 getEleVal 和 setEleVal 能正确工作
-    (container as any).value = input.value;
-    Object.defineProperty(container, 'value', {
-      get: () => input.value,
-      set: (val) => { input.value = val; }
-    });
-
-    return container;
-  }
-
-  private async syncCurrentDocToDinox(docId: string) {
-    try {
-      // 验证输入参数
-      if (!docId) {
-        showMessage("文档 ID 无效", 3000, "error");
-        return;
-      }
-
-      // 检查设置
-      if (!this.settings.token) {
-        showMessage("请先在设置中配置 Dinox Token", 3000, "error");
-        return;
-      }
-
-      // 从文档 attributes 中获取 noteId
-      const attrs = await getBlockAttrs(docId);
-      const noteId = attrs["custom-dinox-note-id"];
-
-      if (!noteId) {
-        showMessage("未找到关联的 Dinox 笔记 ID，请先创建到 Dinox", 3000, "error");
-        return;
-      }
-
-      // 导出文档内容（去掉 frontmatter 和标题，只有正文）
-      const result = await exportMdContentWithoutFrontmatterAndTitle(docId);
-      if (!result || !result.content) {
-        showMessage("获取文档内容失败", 3000, "error");
-        return;
-      }
-
-      const content = result.content;
-      showMessage("正在同步到 Dinox...", 0, "info");
-
-      const response = await axios.post(
-        `${API_BASE_URL_AI}/api/openapi/updateNote`,
-        {
-          noteId: noteId,
-          contentMd: content,
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: this.settings.token,
-          },
-          timeout: 30000, // 30 秒超时
-        }
-      );
-
-      if (response.status === 200 && response.data.code === "000000") {
-        showMessage(`同步到 Dinox 成功 (ID: ${noteId.substring(0, 8)}...)`, 3000, "info");
-      } else {
-        const errorMsg = response.data?.msg || "未知错误";
-        showMessage(`同步失败：${errorMsg}`, 5000, "error");
-      }
-    } catch (error) {
-      console.error("Dinox: 同步失败：", error);
-      const errorMsg = error.response?.data?.msg || error.message || "网络错误";
-      showMessage(`同步失败：${errorMsg}`, 5000, "error");
-    }
-  }
-
-  private async createCurrentDocToDinox(docId: string) {
-    try {
-      // 验证输入参数
-      if (!docId) {
-        showMessage("文档 ID 无效", 3000, "error");
-        return;
-      }
-
-      // 检查设置
-      if (!this.settings.token) {
-        showMessage("请先在设置中配置 Dinox Token", 3000, "error");
-        return;
-      }
-
-      // 检查是否已经有关联的笔记
-      const existingAttrs = await getBlockAttrs(docId);
-      if (existingAttrs["custom-dinox-note-id"]) {
-        showMessage(
-          `文档已关联到 Dinox 笔记 (ID: ${existingAttrs["custom-dinox-note-id"].substring(0, 8)}...)，请使用同步功能`,
-          3000,
-          "info"
-        );
-        return;
-      }
-
-      // 导出文档内容（去掉 frontmatter 和标题，只包含正文）
-      const result = await exportMdContentWithoutFrontmatterAndTitle(docId);
-      if (!result || !result.content) {
-        showMessage("获取文档内容失败", 3000, "error");
-        return;
-      }
-
-      const content = result.content;
-
-      // 获取文档块信息以获取标题
-      const block = await getBlockByID(docId);
-      const title = block.content || "新建笔记";
-
-      showMessage("正在创建到 Dinox...", 0, "info");
-
-      const response = await axios.post(
-        `${API_BASE_URL_AI}/api/openapi/createNote`,
-        {
-          content: content,
-          title: title,
-          tags: [],
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: this.settings.token,
-          },
-          timeout: 30000, // 30 秒超时
-        }
-      );
-
-      if (response.status === 200 && response.data.code === "000000") {
-        const noteId = response.data.data.noteId;
-
-        // 设置文档 attributes 存储 noteId 和其他元数据
-        const attrs: { [key: string]: string } = {
-          "custom-dinox-note-id": noteId,
-          "custom-dinox-type": "note",
-          "custom-dinox-created-at": new Date().toISOString(),
-        };
-
-        await setBlockAttrs(docId, attrs);
-
-        showMessage(
-          `创建到 Dinox 成功！笔记 ID: ${noteId.substring(0, 8)}...`,
-          5000,
-          "info"
-        );
-      } else {
-        const errorMsg = response.data?.msg || "未知错误";
-        showMessage(`创建失败：${errorMsg}`, 5000, "error");
-      }
-    } catch (error) {
-      console.error("Dinox: 创建失败：", error);
-      const errorMsg = error.response?.data?.msg || error.message || "网络错误";
-      showMessage(`创建失败：${errorMsg}`, 5000, "error");
-    }
-  }
-
-  customTab: () => IModel;
-  private isMobile: boolean;
-  private settingUtils: SettingUtils;
-
-  async loadSettings() {
-    const loadedData = (await this.loadData(STORAGE_NAME)) || {};
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, loadedData);
-
-    // 确保所有必需的字段都有默认值
-    if (!this.settings.ignoreSyncKey) {
-      this.settings.ignoreSyncKey = DEFAULT_SETTINGS.ignoreSyncKey;
-    }
-    if (this.settings.preserveKeys === undefined) {
-      this.settings.preserveKeys = DEFAULT_SETTINGS.preserveKeys;
-    }
-    if (!this.settings.smartSyncHotkey) {
-      this.settings.smartSyncHotkey = DEFAULT_SETTINGS.smartSyncHotkey;
-    }
-    if (!this.settings.batchSyncHotkey) {
-      this.settings.batchSyncHotkey = DEFAULT_SETTINGS.batchSyncHotkey;
-    }
-  }
-
-  async saveSettings() {
-    await this.saveData(STORAGE_NAME, this.settings);
-  }
+const DEFAULT_SYNC_STATE: SyncState = {
+  lastSyncTime: DEFAULT_LAST_SYNC_TIME,
+  notePathById: {},
+};
+
+export default class DinoxSiyuanPlugin extends Plugin {
+  private static readonly SYNC_MESSAGE_ID = "dinox-sync-status";
+  private readonly editorTitleIconEventBindThis =
+    this.editorTitleIconEvent.bind(this);
+  private settings!: DinoPluginSettings;
+  private settingUtils!: SettingUtils;
+  private isMobile = false;
+  private isSyncing = false;
+  private autoSyncTimer: number | null = null;
+  private readonly keydownHandler = this.handleWindowKeydown.bind(this);
 
   async onload() {
-    await this.loadSettings();
+    try {
+      if (!this.setting) {
+        this.setting = new Setting({});
+      }
 
-    console.log("loading Dinox sync plugin", this.i18n);
-    this.eventBus.on("click-editortitleicon", async (event) => {
-      await this.editorTitleIconEventBindThis(event);
-    });
+      await this.loadSettings();
+      this.buildSettingsPanel();
 
-    const frontEnd = getFrontend();
-    this.isMobile = frontEnd === "mobile" || frontEnd === "browser-mobile";
-    // 图标的制作参见帮助文档
-    this.addIcons(`<symbol id="iconD" viewBox="0 0 28 28">
+      this.isMobile =
+        getFrontend() === "mobile" || getFrontend() === "browser-mobile";
+
+      this.eventBus.on(
+        "click-editortitleicon",
+        this.editorTitleIconEventBindThis
+      );
+      window.addEventListener("keydown", this.keydownHandler);
+
+      this.addIcons(`<symbol id="iconDinoxSync" viewBox="0 0 28 28">
   <path d="M10 4h8a8 8 0 0 1 0 16h-8v-16zM12 6v12h6a6 6 0 0 0 0-12h-6z"/>
 </symbol>`);
 
-    const topBarElement = this.addTopBar({
-      icon: "iconD",
-      title: "Dinox 同步",
-      position: "right",
-      callback: () => {
-        if (this.isMobile) {
-          this.addMenu();
-        } else {
+      const topBarElement = this.addTopBar({
+        icon: "iconDinoxSync",
+        title: "Dinox 同步",
+        position: "right",
+        callback: () => {
+          if (this.isMobile) {
+            this.openTopBarMenu();
+            return;
+          }
           let rect = topBarElement.getBoundingClientRect();
-          // 如果被隐藏，则使用更多按钮
           if (rect.width === 0) {
-            rect = document.querySelector("#barMore").getBoundingClientRect();
+            rect = document.querySelector("#barMore")?.getBoundingClientRect?.() as
+              | DOMRect
+              | undefined;
           }
-          if (rect.width === 0) {
-            rect = document
-              .querySelector("#barPlugins")
-              .getBoundingClientRect();
+          if (rect?.width) {
+            this.openTopBarMenu(rect);
+          } else {
+            this.openTopBarMenu();
           }
-          this.addMenu(rect);
-        }
+        },
+      });
+
+      try {
+        this.registerCommands();
+      } catch (error) {
+        console.error("Dinox command registration failed:", error);
+        showMessage(`命令注册失败：${getErrorMessage(error)}`, 5000, "error");
+      }
+      this.refreshAutoSyncSchedule();
+    } catch (error) {
+      console.error("Dinox plugin onload failed:", error);
+      showMessage(`插件初始化失败：${getErrorMessage(error)}`, 7000, "error");
+    }
+  }
+
+  private isMacPlatform(): boolean {
+    return /Mac|iPod|iPhone|iPad/.test(navigator.platform);
+  }
+
+  private getPlatformDefaultHotkeys(): {
+    syncAllHotkey: string;
+    syncCurrentHotkey: string;
+    createNoteHotkey: string;
+  } {
+    if (this.isMacPlatform()) {
+      return {
+        syncAllHotkey: "⌘+⇧+D",
+        syncCurrentHotkey: "⌘+⇧+S",
+        createNoteHotkey: "⌘+⇧+N",
+      };
+    }
+    return {
+      syncAllHotkey: "Ctrl+Shift+D",
+      syncCurrentHotkey: "Ctrl+Shift+S",
+      createNoteHotkey: "Ctrl+Shift+N",
+    };
+  }
+
+  private showSyncMessage(
+    text: string,
+    timeout: number,
+    type: "info" | "error" = "info"
+  ) {
+    showMessage(text, timeout, type, DinoxSiyuanPlugin.SYNC_MESSAGE_ID);
+  }
+
+  private migrateHotkey(value: string, fallback: string): string {
+    const raw = (value || "").trim();
+    if (!raw) {
+      return fallback;
+    }
+    if (this.isMacPlatform()) {
+      return raw
+        .replace(/\bCtrl\b/gi, "⌘")
+        .replace(/\bCmd\b/gi, "⌘")
+        .replace(/\bMod\b/gi, "⌘")
+        .replace(/\bShift\b/gi, "⇧")
+        .replace(/\bAlt\b/gi, "⌥");
+    }
+    return raw
+      .replace(/⌘/g, "Ctrl")
+      .replace(/⇧/g, "Shift")
+      .replace(/⌥/g, "Alt")
+      .replace(/\bMod\b/gi, "Ctrl")
+      .replace(/\bCmd\b/gi, "Ctrl");
+  }
+
+  onLayoutReady() {
+    this.settingUtils?.load();
+  }
+
+  onunload() {
+    this.stopAutoSync();
+    this.eventBus.off(
+      "click-editortitleicon",
+      this.editorTitleIconEventBindThis
+    );
+    window.removeEventListener("keydown", this.keydownHandler);
+  }
+
+  private registerCommands() {
+    this.addCommand({
+      langKey: "dinoxSyncAll",
+      langText: "同步 Dinox 到思源",
+      hotkey: "",
+      callback: async () => {
+        await this.syncNotes();
       },
     });
 
-    const statusIconTemp = document.createElement("template");
-    statusIconTemp.innerHTML = `<div class="toolbar__item ariaLabel" aria-label="Remove plugin-sample Data">
-    <svg>
-        <use xlink:href="#iconTrashcan"></use>
-    </svg>
-</div>`;
-    statusIconTemp.content.firstElementChild.addEventListener("click", () => {
-      confirm(
-        "⚠️",
-        this.i18n.confirmRemove.replace("${name}", this.name),
-        () => {
-          this.removeData(STORAGE_NAME).then(() => {
-            this.data[STORAGE_NAME] = { readonlyText: "Readonly" };
-            showMessage(`[${this.name}]: ${this.i18n.removedData}`);
-          });
-        }
-      );
-    });
-    this.addStatusBar({
-      element: statusIconTemp.content.firstElementChild as HTMLElement,
-    });
-
     this.addCommand({
-      langKey: "syncNotes",
-      hotkey: this.settings.batchSyncHotkey || "⌘+⇧+D",
-      callback: () => {
-        this.fetchData();
-      },
-    });
-
-    this.addCommand({
-      langKey: "smartSync",
-      hotkey: this.settings.smartSyncHotkey || "⌘+⇧+S", 
+      langKey: "dinoxSyncCurrent",
+      langText: "同步当前文档到 Dinox",
+      hotkey: "",
       callback: async () => {
         const docId = await this.getCurrentDocId();
         if (!docId) {
-          showMessage("无法获取当前文档 ID，请确保文档已打开", 3000, "error");
+          showMessage("未找到当前文档", 3000, "error");
           return;
         }
         await this.smartSyncDocToDinox(docId);
@@ -736,36 +254,244 @@ export default class PluginSample extends Plugin {
     });
 
     this.addCommand({
-      langKey: "resetSync",
-      hotkey: "⌘+⇧+R",
-      callback: () => {
-        confirm(
-          "⚠️",
-          "确定要重置同步状态吗？下次同步将获取所有笔记。",
-          async () => {
-            await this.saveData("sync_data.json", {
-              lastSyncTime: "1900-01-01 00:00:00",
-            });
-            showMessage("同步状态已重置！", 3000, "info");
-          }
-        );
+      langKey: "dinoxCreateCurrent",
+      langText: "创建当前文档到 Dinox",
+      hotkey: "",
+      callback: async () => {
+        const docId = await this.getCurrentDocId();
+        if (!docId) {
+          showMessage("未找到当前文档", 3000, "error");
+          return;
+        }
+        await this.createCurrentDocToDinox(docId);
       },
     });
 
+    this.addCommand({
+      langKey: "dinoxSendSelection",
+      langText: "发送选中文本到 Dinox",
+      hotkey: "",
+      callback: async () => {
+        await this.sendSelectedTextToDinox();
+      },
+    });
+  }
+
+  private async loadSettings() {
+    const loaded = (await this.loadData(SETTINGS_STORAGE_FILE)) || {};
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...loaded,
+      typeFolders: {
+        ...DEFAULT_SETTINGS.typeFolders,
+        ...(loaded.typeFolders || {}),
+      },
+      zettelBoxFolders: {
+        ...DEFAULT_SETTINGS.zettelBoxFolders,
+        ...(loaded.zettelBoxFolders || {}),
+      },
+      dailyNotes: {
+        ...DEFAULT_SETTINGS.dailyNotes,
+        ...(loaded.dailyNotes || {}),
+      },
+    };
+    const defaults = this.getPlatformDefaultHotkeys();
+    this.settings.syncAllHotkey = this.migrateHotkey(
+      this.settings.syncAllHotkey,
+      defaults.syncAllHotkey
+    );
+    this.settings.syncCurrentHotkey = this.migrateHotkey(
+      this.settings.syncCurrentHotkey,
+      defaults.syncCurrentHotkey
+    );
+    this.settings.createNoteHotkey = this.migrateHotkey(
+      this.settings.createNoteHotkey,
+      defaults.createNoteHotkey
+    );
+  }
+
+  private async saveSettings() {
+    await this.saveData(SETTINGS_STORAGE_FILE, this.settings);
+  }
+
+  private parseConfiguredHotkey(value: string): {
+    key: string;
+    mod: boolean;
+    alt: boolean;
+    shift: boolean;
+  } | null {
+    const raw = (value || "")
+      .trim()
+      .replace(/⌘/g, "Mod")
+      .replace(/⇧/g, "Shift")
+      .replace(/⌥/g, "Alt")
+      .replace(/⌃/g, "Ctrl");
+    if (!raw) {
+      return null;
+    }
+
+    const parts = raw
+      .split("+")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (parts.length === 0) {
+      return null;
+    }
+
+    let key = "";
+    let mod = false;
+    let alt = false;
+    let shift = false;
+
+    for (const part of parts) {
+      const normalized = part.toLowerCase();
+      if (
+        normalized === "ctrl" ||
+        normalized === "control" ||
+        normalized === "cmd" ||
+        normalized === "command" ||
+        normalized === "mod"
+      ) {
+        mod = true;
+        continue;
+      }
+      if (normalized === "alt" || normalized === "option") {
+        alt = true;
+        continue;
+      }
+      if (normalized === "shift") {
+        shift = true;
+        continue;
+      }
+      key = part.length === 1 ? part.toUpperCase() : part;
+    }
+
+    if (!key) {
+      return null;
+    }
+
+    return { key, mod, alt, shift };
+  }
+
+  private matchesConfiguredHotkey(event: KeyboardEvent, hotkey: string): boolean {
+    const parsed = this.parseConfiguredHotkey(hotkey);
+    if (!parsed) {
+      return false;
+    }
+
+    const eventKey = event.key === " " ? "Space" : event.key.length === 1 ? event.key.toUpperCase() : event.key;
+    const eventMod = this.isMacPlatform()
+      ? event.metaKey || event.ctrlKey
+      : event.ctrlKey || event.metaKey;
+
+    return (
+      eventKey === parsed.key &&
+      eventMod === parsed.mod &&
+      event.altKey === parsed.alt &&
+      event.shiftKey === parsed.shift
+    );
+  }
+
+  private async handleWindowKeydown(event: KeyboardEvent) {
+    if (event.repeat) {
+      return;
+    }
+
+    if (this.matchesConfiguredHotkey(event, this.settings.syncAllHotkey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      await this.syncNotes();
+      return;
+    }
+
+    if (this.matchesConfiguredHotkey(event, this.settings.syncCurrentHotkey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      const docId = await this.getCurrentDocId();
+      if (docId) {
+        await this.smartSyncDocToDinox(docId);
+      }
+      return;
+    }
+
+    if (this.matchesConfiguredHotkey(event, this.settings.createNoteHotkey)) {
+      event.preventDefault();
+      event.stopPropagation();
+      const docId = await this.getCurrentDocId();
+      if (docId) {
+        await this.createCurrentDocToDinox(docId);
+      }
+    }
+  }
+
+  private async loadSyncState(): Promise<SyncState> {
+    const loaded = (await this.loadData(SYNC_STATE_NAME)) || {};
+    return {
+      ...DEFAULT_SYNC_STATE,
+      ...loaded,
+      notePathById: {
+        ...DEFAULT_SYNC_STATE.notePathById,
+        ...(loaded.notePathById || {}),
+      },
+    };
+  }
+
+  private async saveSyncState(state: SyncState) {
+    await this.saveData(SYNC_STATE_NAME, state);
+  }
+
+  private refreshAutoSyncSchedule() {
+    this.stopAutoSync();
+    if (!this.settings.isAutoSync) {
+      return;
+    }
+    this.autoSyncTimer = window.setInterval(async () => {
+      if (!this.isSyncing) {
+        await this.syncNotes();
+      }
+    }, 30 * 60 * 1000);
+  }
+
+  private stopAutoSync() {
+    if (this.autoSyncTimer !== null) {
+      window.clearInterval(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
+  }
+
+  private buildSettingsPanel() {
     this.settingUtils = new SettingUtils({
       plugin: this,
       name: STORAGE_NAME,
     });
+
     this.settingUtils.addItem({
       key: "notebookId",
       value: this.settings.notebookId,
       type: "textinput",
-      title: "NotebookID",
-      description: "你想要同步的笔记本编号",
+      title: "笔记本 ID",
+      description: "同步目标笔记本 ID",
       action: {
         callback: async () => {
-          const value = await this.settingUtils.takeAndSave("notebookId");
-          this.settings.notebookId = value;
+          this.settings.notebookId = String(
+            await this.settingUtils.takeAndSave("notebookId")
+          ).trim();
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "basePath",
+      value: this.settings.basePath,
+      type: "textinput",
+      title: "根目录",
+      description: "在目标笔记本下创建的 Dinox 根目录",
+      action: {
+        callback: async () => {
+          this.settings.basePath = String(
+            await this.settingUtils.takeAndSave("basePath")
+          ).trim();
           await this.saveSettings();
         },
       },
@@ -776,48 +502,15 @@ export default class PluginSample extends Plugin {
       value: this.settings.token,
       type: "textinput",
       title: "Dinox Token",
-      description: "输入 Dinox Token",
+      description: "Dinox API 授权 Token",
       action: {
         callback: async () => {
-          const value = await this.settingUtils.takeAndSave("token");
-          this.settings.token = value;
+          this.settings.token = String(
+            await this.settingUtils.takeAndSave("token")
+          ).trim();
           await this.saveSettings();
         },
       },
-    });
-
-    this.settingUtils.addItem({
-      key: "smartSyncHotkey",
-      value: this.settings.smartSyncHotkey,
-      type: "custom",
-      title: "智能同步快捷键",
-      description: "点击输入框并按下快捷键组合（例如：⌘+⇧+S）",
-      createElement: (currentVal: any) => {
-        return this.createHotkeyInput(currentVal, async (newValue: string) => {
-          this.settings.smartSyncHotkey = newValue;
-          await this.saveSettings();
-          showMessage("快捷键已更新，重启插件后生效", 3000, "info");
-        });
-      },
-      getEleVal: (ele: any) => ele.value,
-      setEleVal: (ele: any, val: any) => { ele.value = val; },
-    });
-
-    this.settingUtils.addItem({
-      key: "batchSyncHotkey", 
-      value: this.settings.batchSyncHotkey,
-      type: "custom",
-      title: "批量同步快捷键",
-      description: "点击输入框并按下快捷键组合（例如：⌘+⇧+D）",
-      createElement: (currentVal: any) => {
-        return this.createHotkeyInput(currentVal, async (newValue: string) => {
-          this.settings.batchSyncHotkey = newValue;
-          await this.saveSettings();
-          showMessage("快捷键已更新，重启插件后生效", 3000, "info");
-        });
-      },
-      getEleVal: (ele: any) => ele.value,
-      setEleVal: (ele: any, val: any) => { ele.value = val; },
     });
 
     this.settingUtils.addItem({
@@ -825,16 +518,35 @@ export default class PluginSample extends Plugin {
       value: this.settings.filenameFormat,
       type: "select",
       title: "文件名格式",
-      description: "选择同步的笔记文件的命名格式",
+      description: "控制新同步文档的命名方式",
       options: {
-        noteId: "笔记 ID（推荐）",
-        title: "笔记标题",
+        noteId: "noteId",
+        title: "标题",
         time: "创建时间",
+        titleDate: "标题 + 日期",
+        template: "模板",
       },
       action: {
         callback: async () => {
-          const value = await this.settingUtils.takeAndSave("filenameFormat");
-          this.settings.filenameFormat = value as "noteId" | "title" | "time";
+          this.settings.filenameFormat = (await this.settingUtils.takeAndSave(
+            "filenameFormat"
+          )) as DinoPluginSettings["filenameFormat"];
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "filenameTemplate",
+      value: this.settings.filenameTemplate,
+      type: "textinput",
+      title: "文件名模板",
+      description: "可用变量：{{title}} {{createDate}} {{createTime}} {{noteId}}",
+      action: {
+        callback: async () => {
+          this.settings.filenameTemplate = String(
+            await this.settingUtils.takeAndSave("filenameTemplate")
+          ).trim();
           await this.saveSettings();
         },
       },
@@ -844,18 +556,194 @@ export default class PluginSample extends Plugin {
       key: "fileLayout",
       value: this.settings.fileLayout,
       type: "select",
-      title: "文件布局",
-      description: "选择同步笔记的组织方式",
+      title: "目录布局",
+      description: "是否按日期创建目录",
       options: {
-        nested: "嵌套（按日期分组）",
-        flat: "平铺（所有文件在同一级）",
+        nested: "按日期分层",
+        flat: "平铺",
       },
       action: {
         callback: async () => {
-          const value = await this.settingUtils.takeAndSave("fileLayout");
-          this.settings.fileLayout = value as "flat" | "nested";
+          this.settings.fileLayout = (await this.settingUtils.takeAndSave(
+            "fileLayout"
+          )) as DinoPluginSettings["fileLayout"];
           await this.saveSettings();
         },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "typeFoldersEnabled",
+      value: this.settings.typeFolders.enabled,
+      type: "checkbox",
+      title: "按类型分目录",
+      description: "将 note / crawl 分别写入不同目录",
+      action: {
+        callback: async () => {
+          this.settings.typeFolders.enabled = Boolean(
+            await this.settingUtils.takeAndSave("typeFoldersEnabled")
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "typeFolderNote",
+      value: this.settings.typeFolders.note,
+      type: "textinput",
+      title: "普通笔记目录",
+      description: "type=note 时使用",
+      action: {
+        callback: async () => {
+          this.settings.typeFolders.note =
+            sanitizeFolderSegment(
+              String(await this.settingUtils.takeAndSave("typeFolderNote"))
+            ) || DEFAULT_SETTINGS.typeFolders.note;
+          this.settingUtils.set("typeFolderNote", this.settings.typeFolders.note);
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "typeFolderMaterial",
+      value: this.settings.typeFolders.material,
+      type: "textinput",
+      title: "资料目录",
+      description: "type=crawl/material 时使用",
+      action: {
+        callback: async () => {
+          this.settings.typeFolders.material =
+            sanitizeFolderSegment(
+              String(await this.settingUtils.takeAndSave("typeFolderMaterial"))
+            ) || DEFAULT_SETTINGS.typeFolders.material;
+          this.settingUtils.set(
+            "typeFolderMaterial",
+            this.settings.typeFolders.material
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "zettelBoxFoldersEnabled",
+      value: this.settings.zettelBoxFolders.enabled,
+      type: "checkbox",
+      title: "按卡片盒分目录",
+      description: "存在 zettelBoxes 时使用首个卡片盒名作为目录",
+      action: {
+        callback: async () => {
+          this.settings.zettelBoxFolders.enabled = Boolean(
+            await this.settingUtils.takeAndSave("zettelBoxFoldersEnabled")
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "ignoreSyncKey",
+      value: this.settings.ignoreSyncKey,
+      type: "textinput",
+      title: "忽略同步键",
+      description: "文档 frontmatter 或属性中存在该键且为 true 时跳过同步",
+      action: {
+        callback: async () => {
+          const raw = String(
+            await this.settingUtils.takeAndSave("ignoreSyncKey")
+          ).trim();
+          this.settings.ignoreSyncKey = raw || DEFAULT_SETTINGS.ignoreSyncKey;
+          this.settingUtils.set("ignoreSyncKey", this.settings.ignoreSyncKey);
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "preserveKeys",
+      value: this.settings.preserveKeys,
+      type: "textarea",
+      title: "保留 frontmatter 键",
+      description: "逗号或换行分隔，更新本地文档时覆盖回去",
+      action: {
+        callback: async () => {
+          this.settings.preserveKeys = String(
+            await this.settingUtils.takeAndSave("preserveKeys")
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "template",
+      value: this.settings.template,
+      type: "textarea",
+      title: "Dinox 拉取模板",
+      description: `请求 ${API_BASE_URL}/openapi/v5/notes 时使用`,
+      action: {
+        callback: async () => {
+          this.settings.template = String(
+            await this.settingUtils.takeAndSave("template")
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "syncAllHotkey",
+      value: this.settings.syncAllHotkey,
+      type: "custom",
+      title: "全量同步快捷键",
+      description: "保存后立即生效",
+      createElement: (currentVal: string) =>
+        this.createHotkeyInput(currentVal, async (value) => {
+          this.settings.syncAllHotkey = value;
+          await this.saveSettings();
+          showMessage("快捷键已保存", 3000, "info");
+        }),
+      getEleVal: (ele: HTMLElement) => (ele as any).value,
+      setEleVal: (ele: HTMLElement, val: string) => {
+        (ele as any).value = val;
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "syncCurrentHotkey",
+      value: this.settings.syncCurrentHotkey,
+      type: "custom",
+      title: "当前文档同步快捷键",
+      description: "保存后立即生效",
+      createElement: (currentVal: string) =>
+        this.createHotkeyInput(currentVal, async (value) => {
+          this.settings.syncCurrentHotkey = value;
+          await this.saveSettings();
+          showMessage("快捷键已保存", 3000, "info");
+        }),
+      getEleVal: (ele: HTMLElement) => (ele as any).value,
+      setEleVal: (ele: HTMLElement, val: string) => {
+        (ele as any).value = val;
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "createNoteHotkey",
+      value: this.settings.createNoteHotkey,
+      type: "custom",
+      title: "创建到 Dinox 快捷键",
+      description: "保存后立即生效",
+      createElement: (currentVal: string) =>
+        this.createHotkeyInput(currentVal, async (value) => {
+          this.settings.createNoteHotkey = value;
+          await this.saveSettings();
+          showMessage("快捷键已保存", 3000, "info");
+        }),
+      getEleVal: (ele: HTMLElement) => (ele as any).value,
+      setEleVal: (ele: HTMLElement, val: string) => {
+        (ele as any).value = val;
       },
     });
 
@@ -864,495 +752,1213 @@ export default class PluginSample extends Plugin {
       value: this.settings.isAutoSync,
       type: "checkbox",
       title: "自动同步",
-      description: "启用后将每 30 分钟自动同步一次",
+      description: "每 30 分钟自动执行一次 Dinox -> 思源 增量同步",
       action: {
         callback: async () => {
-          const value = await this.settingUtils.takeAndSave("isAutoSync");
-          this.settings.isAutoSync = value;
+          this.settings.isAutoSync = Boolean(
+            await this.settingUtils.takeAndSave("isAutoSync")
+          );
+          await this.saveSettings();
+          this.refreshAutoSyncSchedule();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "dailyNotesEnabled",
+      value: this.settings.dailyNotes.enabled,
+      type: "checkbox",
+      title: "启用每日汇总",
+      description: "把同步的 Dinox 笔记同步到对应日期的每日汇总文档",
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.enabled = Boolean(
+            await this.settingUtils.takeAndSave("dailyNotesEnabled")
+          );
           await this.saveSettings();
         },
       },
     });
 
-    // 添加同步状态显示
+    this.settingUtils.addItem({
+      key: "dailyNotesNotebookId",
+      value: this.settings.dailyNotes.notebookId,
+      type: "textinput",
+      title: "每日汇总笔记本 ID",
+      description: "为空时复用主同步笔记本",
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.notebookId = String(
+            await this.settingUtils.takeAndSave("dailyNotesNotebookId")
+          ).trim();
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "dailyNotesBasePath",
+      value: this.settings.dailyNotes.basePath,
+      type: "textinput",
+      title: "每日汇总目录",
+      description: "例如 Daily Notes/Dinox",
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.basePath = String(
+            await this.settingUtils.takeAndSave("dailyNotesBasePath")
+          ).trim();
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "dailyNotesHeading",
+      value: this.settings.dailyNotes.heading,
+      type: "textinput",
+      title: "每日汇总标题",
+      description: "受管区域上方显示的标题",
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.heading =
+            String(
+              await this.settingUtils.takeAndSave("dailyNotesHeading")
+            ).trim() || DEFAULT_SETTINGS.dailyNotes.heading;
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "dailyNotesInsertTo",
+      value: this.settings.dailyNotes.insertTo,
+      type: "select",
+      title: "新增位置",
+      description: "新增条目插入到受管区域顶部或底部",
+      options: {
+        top: "顶部",
+        bottom: "底部",
+      },
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.insertTo = (await this.settingUtils.takeAndSave(
+            "dailyNotesInsertTo"
+          )) as "top" | "bottom";
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "dailyNotesCreateIfMissing",
+      value: this.settings.dailyNotes.createIfMissing,
+      type: "checkbox",
+      title: "不存在时自动创建每日汇总",
+      description: "关闭后仅更新已存在的每日汇总文档",
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.createIfMissing = Boolean(
+            await this.settingUtils.takeAndSave("dailyNotesCreateIfMissing")
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "dailyNotesIncludePreview",
+      value: this.settings.dailyNotes.includePreview,
+      type: "checkbox",
+      title: "包含内容预览",
+      description: "在每日汇总中附带简短预览",
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.includePreview = Boolean(
+            await this.settingUtils.takeAndSave("dailyNotesIncludePreview")
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
     this.settingUtils.addItem({
       key: "syncStatus",
       value: "",
       type: "hint",
       title: "同步状态",
-      description: "显示当前的同步状态信息",
-      createElement: (currentVal: any) => {
-        const hintElement = document.createElement("div");
-        hintElement.className = "b3-label fn__flex-center";
-
-        // 初始显示加载状态，然后异步更新
-        hintElement.innerHTML =
-          '<div style="color: #999;">正在加载同步状态...</div>';
-
-        // 异步加载同步状态
-        this.updateSyncStatusElement(hintElement);
-
-        return hintElement;
+      description: "显示最近一次增量同步时间",
+      createElement: () => {
+        const element = document.createElement("div");
+        element.className = "b3-label fn__flex-center";
+        element.innerHTML = "<div>正在加载同步状态...</div>";
+        void this.updateSyncStatusElement(element);
+        return element;
       },
     });
 
-    // 添加重置同步时间按钮
     this.settingUtils.addItem({
-      key: "resetSyncTime",
+      key: "resetSyncState",
       value: "",
       type: "button",
       title: "重置同步状态",
-      description: "清除上次同步时间，下次同步将获取所有笔记",
+      description: "下次同步将从起始时间重新拉取",
       button: {
-        label: "重置同步时间",
+        label: "重置",
         callback: async () => {
-          await this.resetSyncTime();
-          // 重置后刷新同步状态显示
-          this.refreshSyncStatus();
+          await this.resetSyncStateWithConfirm();
         },
       },
     });
 
-    try {
-      this.settingUtils.load();
-    } catch (error) {
-      console.error(
-        "Error loading settings storage, probably empty config json:",
-        error
-      );
-    }
-  }
-
-  onLayoutReady() {
     this.settingUtils.load();
-
-    // 启动自动同步（如果启用）
-    if (this.settings.isAutoSync) {
-      this.startAutoSync();
-    }
   }
 
-  private startAutoSync() {
-    // 每 30 分钟自动同步一次
-    setInterval(async () => {
-      if (!this.isSyncing) {
-        console.log("Dinox: 触发自动同步...");
-        try {
-          await this.fetchData();
-        } catch (error) {
-          console.error("Dinox: 自动同步失败：", error);
-        }
-      } else {
-        console.log("Dinox: 自动同步跳过，同步已在进行中");
+  private createHotkeyInput(
+    currentValue: string,
+    onchange: (value: string) => void | Promise<void>
+  ): HTMLElement {
+    const container = document.createElement("div");
+    container.className = "fn__flex fn__flex-center";
+    container.style.gap = "8px";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "b3-text-field fn__flex-center";
+    input.style.width = "180px";
+    input.placeholder = this.isMacPlatform()
+      ? "点击后按下快捷键，如 ⌘+⇧+S"
+      : "点击后按下快捷键，如 Ctrl+Shift+S";
+    input.readOnly = true;
+    const rawCurrentValue = currentValue || "";
+    input.value = rawCurrentValue;
+
+    const clearButton = document.createElement("button");
+    clearButton.className = "b3-button b3-button--outline";
+    clearButton.textContent = "清空";
+    clearButton.onclick = async (event) => {
+      event.preventDefault();
+      input.dataset.rawValue = "";
+      input.value = "";
+      await onchange("");
+    };
+
+    input.addEventListener("keydown", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (["Control", "Shift", "Alt", "Meta"].includes(event.key)) {
+        return;
       }
-    }, 30 * 60 * 1000); // 30 分钟
-  }
-
-  private async resetSyncTime() {
-    // 参照 Obsidian 插件的逻辑，添加确认对话框
-    confirm(
-      "⚠️",
-      "确定要重置同步状态吗？下次同步将获取所有笔记。",
-      async () => {
-        try {
-          // 重置同步时间为默认值，与 Obsidian 插件保持一致
-          const pData = (await this.loadData("sync_data.json")) || {};
-          await this.saveData("sync_data.json", {
-            ...pData,
-            lastSyncTime: "1900-01-01 00:00:00", // 使用原始的重置值
-          });
-
-          showMessage("同步状态已重置！下次同步将获取所有笔记。", 5000, "info");
-          console.log("Dinox: 同步时间已重置");
-        } catch (error) {
-          console.error("Dinox: 重置同步时间失败：", error);
-          showMessage("重置同步状态失败：" + error.message, 5000, "error");
-        }
+      if (event.key === "Escape") {
+        input.value = "";
+        await onchange("");
+        return;
       }
-    );
+      const parts: string[] = [];
+      const isMac = this.isMacPlatform();
+      if (event.metaKey || event.ctrlKey) {
+        parts.push(isMac ? "⌘" : "Ctrl");
+      }
+      if (event.altKey) {
+        parts.push(isMac ? "⌥" : "Alt");
+      }
+      if (event.shiftKey) {
+        parts.push(isMac ? "⇧" : "Shift");
+      }
+      let key = event.key;
+      if (key === " ") key = "Space";
+      if (key.length === 1) key = key.toUpperCase();
+      parts.push(key);
+      const storedValue = parts.join("+");
+      input.dataset.rawValue = storedValue;
+      input.value = storedValue;
+      await onchange(storedValue);
+    });
+
+    (container as HTMLDivElement & { value: string }).value = rawCurrentValue;
+    Object.defineProperty(container, "value", {
+      get: () => input.dataset.rawValue || "",
+      set: (value: string) => {
+        input.dataset.rawValue = value || "";
+        input.value = value || "";
+      },
+    });
+    input.dataset.rawValue = rawCurrentValue;
+
+    container.appendChild(input);
+    container.appendChild(clearButton);
+    return container;
   }
 
-  private async updateSyncStatusElement(hintElement: HTMLElement) {
+  private async updateSyncStatusElement(element: HTMLElement) {
     try {
-      const pData = (await this.loadData("sync_data.json")) || {};
-      const lastSyncTime = pData.lastSyncTime || "从未同步";
-      const isFirstSync = lastSyncTime === "1900-01-01 00:00:00";
-
-      hintElement.innerHTML = `
-                <div style="text-align: left; width: 100%;">
-                    <div>上次同步时间：<strong>${
-                      isFirstSync ? "从未同步" : lastSyncTime
-                    }</strong></div>
-                    <div style="margin-top: 4px; color: #666; font-size: 12px;">
-                        ${
-                          isFirstSync
-                            ? "下次同步将获取所有笔记"
-                            : "下次同步将获取增量更新"
-                        }
-                    </div>
-                </div>
-            `;
+      const state = await this.loadSyncState();
+      const lastSyncTime =
+        state.lastSyncTime === DEFAULT_LAST_SYNC_TIME
+          ? "尚未同步"
+          : state.lastSyncTime;
+      element.innerHTML = `
+        <div style="text-align:left;width:100%;">
+          <div>最近同步时间：<strong>${lastSyncTime}</strong></div>
+          <div style="margin-top:4px;color:var(--b3-theme-on-surface-light);font-size:12px;">
+            ${
+              state.lastSyncTime === DEFAULT_LAST_SYNC_TIME
+                ? "下次同步将进行全量拉取"
+                : "下次同步将基于最近成功时间做增量拉取"
+            }
+          </div>
+        </div>
+      `;
     } catch (error) {
-      hintElement.innerHTML =
-        '<div style="color: #f56565;">无法读取同步状态</div>';
+      element.innerHTML = `<div style="color:var(--b3-theme-error);">读取同步状态失败：${getErrorMessage(
+        error
+      )}</div>`;
     }
   }
 
   private refreshSyncStatus() {
-    // 重新获取并更新同步状态显示元素
-    const statusElement = this.settingUtils.getElement("syncStatus");
-    if (statusElement) {
-      this.updateSyncStatusElement(statusElement);
+    const element = this.settingUtils?.getElement("syncStatus");
+    if (element) {
+      void this.updateSyncStatusElement(element);
     }
   }
 
-  async onunload() {
-    console.log(this.i18n.byePlugin);
-    showMessage("Goodbye SiYuan Plugin");
-    console.log("onunload");
-  }
-
-  uninstall() {
-    console.log("uninstall");
-  }
-
-  async updateCards(options: ICardData) {
-    options.cards.sort((a: ICard, b: ICard) => {
-      if (a.blockID < b.blockID) {
-        return -1;
+  private async resetSyncStateWithConfirm() {
+    confirm(
+      "⚠️",
+      "确认重置同步状态吗？重置后下次会从起始时间重新拉取 Dinox 数据。",
+      async () => {
+        await this.saveSyncState(DEFAULT_SYNC_STATE);
+        this.refreshSyncStatus();
+        showMessage("同步状态已重置", 3000, "info");
       }
-      if (a.blockID > b.blockID) {
-        return 1;
-      }
-      return 0;
-    });
-    return options;
+    );
   }
 
-  private async fetchData() {
-    if (this.isSyncing) {
-      showMessage("同步已在进行中，请勿重复操作", 3000, "info");
+  private async editorTitleIconEvent({ detail }: { detail: any }) {
+    const menu: Menu | undefined = detail?.menu;
+    if (!menu) {
       return;
     }
 
-    if (!this.settings.token) {
-      showMessage("Token 不能为空，请在设置中配置", 3000, "error");
-      return;
-    }
-
-    if (!this.settings.notebookId) {
-      showMessage("NotebookID 不能为空，请在设置中配置", 3000, "error");
-      return;
-    }
-
-    this.isSyncing = true;
-    showMessage("开始同步，请勿重复操作", 0, "info");
-
-    const syncStartTime = new Date();
-    let processedCount = 0;
-    let deletedCount = 0;
-    let errorOccurred = false;
-
-    try {
-      console.log("Dinox: 同步开始");
-
-      // 1. 获取上次同步时间
-      const pData = (await this.loadData("sync_data.json")) || {};
-      let lastSyncTime = "1900-01-01 00:00:00";
-      if (pData.lastSyncTime && pData.lastSyncTime !== "") {
-        try {
-          const lTime = new Date(pData.lastSyncTime);
-          lastSyncTime = formatDate(lTime);
-        } catch (e) {
-          console.warn("无效的上次同步时间，使用默认时间", pData.lastSyncTime);
-          lastSyncTime = "1900-01-01 00:00:00";
-        }
-      }
-      console.log("上次同步时间：", lastSyncTime);
-
-      // 2. 从 API 获取数据
-      const dayNotes = await this.fetchNotesFromApi(lastSyncTime);
-
-      // 3. 处理 API 响应
-      const processingResults = await this.processApiResponse(dayNotes);
-      processedCount = processingResults.processed;
-      deletedCount = processingResults.deleted;
-
-      // 4. 更新同步时间
-      const newLastSyncTime = formatDate(syncStartTime);
-      console.log("保存新的同步时间：", newLastSyncTime);
-      await this.saveData("sync_data.json", {
-        ...pData,
-        lastSyncTime: newLastSyncTime,
-      });
-
-      console.log("Dinox: 同步成功完成");
-      showMessage(
-        `同步完成！处理：${processedCount}, 删除：${deletedCount}`,
-        5000,
-        "info"
-      );
-
-      // 同步完成后刷新状态显示
-      this.refreshSyncStatus();
-    } catch (error) {
-      errorOccurred = true;
-      console.error("Dinox: 同步失败：", error);
-      showMessage(`同步失败：${error.message}`, 10000, "error");
-    } finally {
-      this.isSyncing = false;
-    }
-  }
-
-  private async fetchNotesFromApi(lastSyncTime: string): Promise<DayNote[]> {
-    const requestBody = {
-      noteId: 0,
-      lastSyncTime: lastSyncTime,
-    };
-
-    console.log("调用 API，请求体：", requestBody);
-
-    try {
-      const resp = await axios.post(
-        `${API_BASE_URL_AI}/api/openapi/listNotes`,
-        requestBody,
-        {
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: this.settings.token,
-          },
-        }
-      );
-
-      if (resp.status !== 200) {
-        throw new Error(`API HTTP 错误：状态 ${resp.status}`);
-      }
-
-      const result = resp.data as GetNoteApiResult;
-
-      if (!result || result.code !== "000000") {
-        const errorMsg = result?.msg || "未知 API 错误";
-        throw new Error(
-          `API 逻辑错误：代码 ${result?.code || "N/A"} - ${errorMsg}`
-        );
-      }
-
-      console.log(`接收到 ${result.data?.length || 0} 天的笔记数据`);
-      return result.data || [];
-    } catch (error) {
-      console.error("从 API 获取数据时出错：", error);
-      throw error;
-    }
-  }
-
-  private async processApiResponse(
-    dayNotes: DayNote[]
-  ): Promise<{ processed: number; deleted: number }> {
-    let processed = 0;
-    let deleted = 0;
-    console.log("处理 API 响应：", dayNotes);
-
-    for (const dayData of dayNotes) {
-      for (const noteData of dayData.notes) {
-        try {
-          const result = await this.handleNoteProcessing(
-            noteData,
-            dayData.date
-          );
-          if (result === "deleted") deleted++;
-          else if (result === "processed") processed++;
-        } catch (noteError) {
-          console.error(`处理笔记 ${noteData.noteId} 失败：`, noteError);
-          showMessage(
-            `处理笔记失败 ${noteData.noteId.substring(0, 8)}...`,
-            5000,
-            "error"
-          );
-        }
-      }
-    }
-    return { processed, deleted };
-  }
-
-  private async handleNoteProcessing(
-    noteData: Note,
-    date: string
-  ): Promise<"processed" | "deleted" | "skipped"> {
-    const sourceId = noteData.noteId;
-
-    // 生成文件名
-    let filename = "";
-    const format = this.settings.filenameFormat;
-
-    if (format === "noteId") {
-      filename = sourceId;
-    } else if (format === "title") {
-      if (noteData.title && noteData.title.trim() !== "") {
-        filename = sanitizeFilename(noteData.title);
-      } else {
-        filename = sourceId;
-      }
-    } else if (format === "time") {
-      try {
-        const createDate = new Date(noteData.createTime);
-        filename = sanitizeFilename(formatDate(createDate));
-      } catch (e) {
-        console.warn(
-          `无效的创建时间，使用 noteId 作为文件名`,
-          noteData.createTime
-        );
-        filename = sourceId;
-      }
-    } else {
-      filename = sourceId;
-    }
-
-    filename = filename || sourceId || "Untitled";
-
-    // 确定路径
-    let notePath = "";
-    if (this.settings.fileLayout === "nested") {
-      const safeDate = date.replace(/[^0-9-]/g, "");
-      notePath = `/${safeDate}/${filename}`;
-    } else {
-      notePath = `/${filename}`;
-    }
-
-    // 处理删除或创建/更新
-    if (noteData.isDel) {
-      const ids = await getIDsByHPath(this.settings.notebookId, notePath);
-      if (ids.length > 0) {
-        console.log(`删除标记为删除的笔记：${notePath}`);
-        try {
-          const id = ids[0];
-          const path = await getPathByID(id);
-          await removeDoc(this.settings.notebookId, path);
-          return "deleted";
-        } catch (deleteError) {
-          console.error(`删除文件失败 ${notePath}：`, deleteError);
-          throw deleteError;
-        }
-      } else {
-        return "skipped";
-      }
-    } else {
-      try {
-        // 检查是否已存在
-        const ids = await getIDsByHPath(this.settings.notebookId, notePath);
-        
-        let content = "";
-        if (noteData.audioUrl) {
-          content = `
-<audio src="${noteData.audioUrl}" controls></audio>
-
-${noteData.content}
-          `;
-        } else {
-          content = noteData.content || "";
-        }
-
-        const attrs: { [key: string]: string } = {
-          "custom-dinox-note-id": noteData.noteId,
-          "custom-dinox-is-audio": noteData.isAudio ? "true" : "false",
-          "custom-dinox-type": noteData.type,
-        };
-
-        if (ids.length > 0) {
-          // 文档已存在，进行原地更新
-          const docId = ids[0];
-          console.log(`原地更新笔记：${notePath}`);
-          
-          // 更新文档内容
-          await updateBlock("markdown", content, docId);
-          
-          // 更新属性
-          await setBlockAttrs(docId, attrs);
-          
-          console.log(`成功更新笔记并设置属性：${notePath}`);
-        } else {
-          // 文档不存在，创建新笔记
-          console.log(`创建新笔记：${notePath}`);
-          
-          const docId = await createDocWithMd(
-            this.settings.notebookId,
-            notePath,
-            content
-          );
-
-          await setBlockAttrs(docId, attrs);
-          console.log(`成功创建笔记并设置属性：${notePath}`);
-        }
-        
-        return "processed";
-      } catch (error) {
-        console.error(`创建/更新文件失败 ${notePath}：`, error);
-        throw error;
-      }
-    }
-  }
-
-  private addMenu(rect?: DOMRect) {
-    const menu = new Menu("topBarDinoxSync", () => {
-      console.log("Dinox 同步菜单关闭");
-    });
+    const docId =
+      detail?.data?.id ||
+      detail?.protyle?.block?.rootID ||
+      (await this.getCurrentDocId());
 
     menu.addItem({
-      icon: "iconRefresh",
-      label: "批量同步笔记",
-      accelerator: this.commands[0]?.customHotkey,
-      click: () => {
-        this.fetchData();
+      icon: "iconCloudSync",
+      label: "智能同步到 Dinox",
+      click: async () => {
+        if (!docId) {
+          showMessage("未找到当前文档", 3000, "error");
+          return;
+        }
+        await this.smartSyncDocToDinox(docId);
       },
     });
 
-    // menu.addItem({
-    //   icon: "iconCloudSync",
-    //   label: "智能同步当前文档",
-    //   accelerator: this.commands[1]?.customHotkey,
-    //   click: async () => {
-    //     const docId = await this.getCurrentDocId();
-    //     if (!docId) {
-    //       showMessage("无法获取当前文档 ID，请确保文档已打开", 3000, "error");
-    //       return;
-    //     }
-    //     await this.smartSyncDocToDinox(docId);
-    //   },
-    // });
+    menu.addItem({
+      icon: "iconPlus",
+      label: "创建到 Dinox",
+      click: async () => {
+        if (!docId) {
+          showMessage("未找到当前文档", 3000, "error");
+          return;
+        }
+        await this.createCurrentDocToDinox(docId);
+      },
+    });
+
+    const selectedText = this.getSelectedText();
+    if (selectedText) {
+      menu.addItem({
+        icon: "iconUpload",
+        label: "发送选中文本到 Dinox",
+        click: async () => {
+          await this.sendSelectedTextToDinox(selectedText);
+        },
+      });
+    }
+  }
+
+  private openTopBarMenu(rect?: DOMRect) {
+    const menu = new Menu("topBarDinoxSync");
+
+    menu.addItem({
+      icon: "iconRefresh",
+      label: "同步 Dinox 到思源",
+      accelerator: this.settings.syncAllHotkey,
+      click: async () => {
+        await this.syncNotes();
+      },
+    });
+
+    menu.addItem({
+      icon: "iconCloudSync",
+      label: "同步当前文档到 Dinox",
+      accelerator: this.settings.syncCurrentHotkey,
+      click: async () => {
+        const docId = await this.getCurrentDocId();
+        if (!docId) {
+          showMessage("未找到当前文档", 3000, "error");
+          return;
+        }
+        await this.smartSyncDocToDinox(docId);
+      },
+    });
+
+    menu.addItem({
+      icon: "iconPlus",
+      label: "创建当前文档到 Dinox",
+      accelerator: this.settings.createNoteHotkey,
+      click: async () => {
+        const docId = await this.getCurrentDocId();
+        if (!docId) {
+          showMessage("未找到当前文档", 3000, "error");
+          return;
+        }
+        await this.createCurrentDocToDinox(docId);
+      },
+    });
+
+    if (this.getSelectedText()) {
+      menu.addItem({
+        icon: "iconUpload",
+        label: "发送选中文本到 Dinox",
+        click: async () => {
+          await this.sendSelectedTextToDinox();
+        },
+      });
+    }
 
     menu.addItem({
       icon: "iconTrashcan",
       label: "重置同步状态",
       click: async () => {
-        confirm(
-          "⚠️",
-          "确定要重置同步状态吗？下次同步将获取所有笔记。",
-          async () => {
-            await this.saveData("sync_data.json", {
-              lastSyncTime: "1900-01-01 00:00:00",
-            });
-            showMessage("同步状态已重置！", 3000, "info");
-          }
-        );
+        await this.resetSyncStateWithConfirm();
       },
     });
 
-    menu.addItem({
-      icon: "iconSettings",
-      label: "打开设置",
-      click: () => {
-        // 调用思源的设置面板（如果有的话）
-        showMessage("请在插件管理中打开设置面板", 3000, "info");
-      },
-    });
-
-    if (this.isMobile) {
+    if (this.isMobile || !rect) {
       menu.fullscreen();
-    } else {
-      menu.open({
-        x: rect.right,
-        y: rect.bottom,
-        isLeft: true,
+      return;
+    }
+
+    menu.open({
+      x: rect.right,
+      y: rect.bottom,
+      isLeft: true,
+    });
+  }
+
+  private async getCurrentDocId(): Promise<string | null> {
+    const protyles = document.querySelectorAll(".protyle:not(.fn__none)");
+    const current = protyles[protyles.length - 1];
+    const root = current?.querySelector?.("[data-node-id]");
+    const id = root?.getAttribute?.("data-node-id");
+    if (id) {
+      return id;
+    }
+    const matched = location.hash.match(/#(\d{14}-[a-z0-9]{7})/);
+    return matched?.[1] || null;
+  }
+
+  private getSelectedText(): string {
+    const text = window.getSelection?.()?.toString?.() || "";
+    return text.trim();
+  }
+
+  private async sendSelectedTextToDinox(selectedText?: string) {
+    if (!this.settings.token.trim()) {
+      showMessage("请先配置 Dinox Token", 3000, "error");
+      return;
+    }
+
+    const content = (selectedText || this.getSelectedText()).trim();
+    if (!content) {
+      showMessage("当前没有选中文本", 3000, "error");
+      return;
+    }
+
+    try {
+      showMessage("正在发送选中文本到 Dinox...", 3000, "info");
+      const title =
+        content.split(/\r?\n/, 1)[0].trim().slice(0, 50) || "New Note from SiYuan";
+      const noteId = await createDinoxNote({
+        token: this.settings.token,
+        title,
+        tags: [],
+        content,
       });
+      showMessage(`发送成功：${noteId.substring(0, 8)}...`, 4000, "info");
+    } catch (error) {
+      console.error("sendSelectedTextToDinox failed:", error);
+      showMessage(`发送失败：${getErrorMessage(error)}`, 6000, "error");
+    }
+  }
+
+  private async syncNotes() {
+    if (this.isSyncing) {
+      showMessage("同步已在执行中", 3000, "info");
+      return;
+    }
+    if (!this.settings.token.trim()) {
+      showMessage("请先配置 Dinox Token", 3000, "error");
+      return;
+    }
+    if (!this.settings.notebookId.trim()) {
+      showMessage("请先配置思源笔记本 ID", 3000, "error");
+      return;
+    }
+
+    this.isSyncing = true;
+    const state = await this.loadSyncState();
+    const syncStartTime = new Date();
+    let processed = 0;
+    let deleted = 0;
+    const dailyNoteChanges = new Map<string, DailyNoteChangeSet>();
+
+    this.showSyncMessage("开始同步 Dinox -> 思源...", 3000, "info");
+
+    try {
+      const lastSyncTime = normalizeDinoxDateTime(state.lastSyncTime);
+      const dayNotes = await fetchNotesFromApi({
+        token: this.settings.token,
+        template: this.settings.template,
+        lastSyncTime,
+      });
+
+      const localIndex = await this.buildLocalDocIndex(this.settings.notebookId);
+
+      for (const dayData of [...dayNotes].reverse()) {
+        for (const noteData of [...dayData.notes].reverse()) {
+          const result = await this.processSingleNote(
+            noteData,
+            dayData.date,
+            localIndex,
+            state
+          );
+          if (result.status === "processed") {
+            processed++;
+            if (this.settings.dailyNotes.enabled) {
+              const changeSet =
+                dailyNoteChanges.get(dayData.date) || { added: [], removed: [] };
+              changeSet.added.push({
+                noteId: noteData.noteId,
+                docId: result.docId,
+                title: result.title,
+                preview: result.preview,
+              });
+              dailyNoteChanges.set(dayData.date, changeSet);
+            }
+          }
+          if (result.status === "deleted") {
+            deleted++;
+            if (this.settings.dailyNotes.enabled) {
+              const changeSet =
+                dailyNoteChanges.get(dayData.date) || { added: [], removed: [] };
+              changeSet.removed.push({
+                noteId: noteData.noteId,
+                docId: result.docId,
+                title: result.title,
+              });
+              dailyNoteChanges.set(dayData.date, changeSet);
+            }
+          }
+        }
+      }
+
+      if (this.settings.dailyNotes.enabled) {
+        await this.applyDailyNoteChanges(dailyNoteChanges);
+      }
+
+      state.lastSyncTime = formatDate(syncStartTime);
+      await this.saveSyncState(state);
+      this.refreshSyncStatus();
+      this.showSyncMessage(
+        `同步完成，更新 ${processed} 条，删除 ${deleted} 条`,
+        5000,
+        "info"
+      );
+    } catch (error) {
+      console.error("Dinox sync failed:", error);
+      this.showSyncMessage(`同步失败：${getErrorMessage(error)}`, 8000, "error");
+    } finally {
+      this.isSyncing = false;
+    }
+  }
+
+  private async buildLocalDocIndex(
+    notebookId: string
+  ): Promise<Record<string, LocalDocInfo>> {
+    const escapedNotebook = notebookId.replace(/'/g, "''");
+    const rows = await sql(
+      `select id, hpath, content from blocks where box='${escapedNotebook}' and type='d'`
+    );
+
+    const infos = await Promise.all(
+      rows.map(async (row: { id: string; hpath: string; content: string }) => {
+        const [attrs, path] = await Promise.all([
+          getBlockAttrs(row.id),
+          getPathByID(row.id),
+        ]);
+        const info: LocalDocInfo = {
+          id: row.id,
+          path,
+          hPath: row.hpath || "",
+          title: row.content || "",
+          attrs: attrs || {},
+        };
+        return info;
+      })
+    );
+
+    const index: Record<string, LocalDocInfo> = {};
+    infos.forEach((info) => {
+      const noteId = info.attrs["custom-dinox-note-id"];
+      if (noteId) {
+        index[noteId] = info;
+      }
+    });
+    return index;
+  }
+
+  private getPreserveKeys(): string[] {
+    return (this.settings.preserveKeys || "")
+      .split(/[,\n\r]+/)
+      .map((item) => item.trim())
+      .filter(
+        (item) =>
+          item &&
+          item !== "noteId" &&
+          item !== "source_app_id" &&
+          item !== "title"
+      );
+  }
+
+  private stringifyAttrValue(value: unknown): string {
+    if (value === undefined) {
+      return "";
+    }
+    return JSON.stringify(value);
+  }
+
+  private parseAttrJson<T>(value?: string): T | null {
+    if (!value?.trim()) {
+      return null;
+    }
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  private parseAttrStringArray(value?: string): string[] {
+    const parsed = this.parseAttrJson<unknown>(value);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .map((item) => String(item || "").trim().replace(/^#/, ""))
+      .filter(Boolean);
+  }
+
+  private getStoredTagsFromAttrs(attrs: Record<string, string>): string[] {
+    const tags = new Set<string>();
+    this.parseAttrStringArray(attrs["custom-dinox-tags"]).forEach((tag) => {
+      tags.add(tag);
+    });
+
+    const frontmatter = this.parseAttrJson<Record<string, unknown>>(
+      attrs["custom-dinox-frontmatter"]
+    );
+    const frontmatterTags = frontmatter?.tags;
+    if (Array.isArray(frontmatterTags)) {
+      frontmatterTags
+        .map((item) => String(item || "").trim().replace(/^#/, ""))
+        .filter(Boolean)
+        .forEach((tag) => tags.add(tag));
+    }
+    return Array.from(tags);
+  }
+
+  private getNoteContentParts(noteData: Note): {
+    frontmatter: string | null;
+    body: string;
+    content: string;
+  } {
+    const split = splitFrontmatter(noteData.content || "");
+    const content = this.withAudioFallback(split.body, noteData.audioUrl);
+    return {
+      frontmatter: split.frontmatter,
+      body: split.body,
+      content,
+    };
+  }
+
+  private buildDinoxAttrs(
+    noteData: Note,
+    date: string,
+    frontmatter: string | null
+  ): Record<string, string> {
+    const parsedFrontmatter = parseFrontmatterRecord(frontmatter);
+    const attrs: Record<string, string> = {
+      "custom-dinox-note-id": (noteData.noteId || "").trim(),
+      "custom-dinox-type": this.getNoteType(noteData),
+      "custom-dinox-date": date,
+      "custom-dinox-title": noteData.title || "",
+      "custom-dinox-is-audio": noteData.isAudio ? "true" : "false",
+      "custom-dinox-create-time": noteData.createTime || "",
+      "custom-dinox-update-time": noteData.updateTime || "",
+      "custom-dinox-audio-url": noteData.audioUrl || "",
+      "custom-dinox-tags": this.stringifyAttrValue(noteData.tags || []),
+      "custom-dinox-zettel-boxes": this.stringifyAttrValue(noteData.zettelBoxes || []),
+    };
+
+    if (frontmatter) {
+      attrs["custom-dinox-frontmatter"] = this.stringifyAttrValue(parsedFrontmatter);
+    }
+
+    return attrs;
+  }
+
+  private async readExistingDocContext(docId: string): Promise<{
+    ignore: boolean;
+    preserved: Record<string, string | boolean | string[]>;
+  }> {
+    const [attrs, exported] = await Promise.all([
+      getBlockAttrs(docId),
+      exportMdContent(docId),
+    ]);
+
+    const split = splitFrontmatter(exported?.content || "");
+    const parsed = parseFrontmatterRecord(split.frontmatter);
+    const ignoreKey = this.settings.ignoreSyncKey;
+    const attrIgnore =
+      attrs?.[ignoreKey] || attrs?.[`custom-${ignoreKey}`] || "";
+    const frontmatterIgnore = parsed[ignoreKey];
+    const ignore =
+      attrIgnore === "true" ||
+      attrIgnore === "1" ||
+      frontmatterIgnore === true ||
+      frontmatterIgnore === "true";
+
+    const preserved: Record<string, string | boolean | string[]> = {};
+    for (const key of this.getPreserveKeys()) {
+      if (parsed[key] !== undefined) {
+        preserved[key] = parsed[key];
+      }
+    }
+    return { ignore, preserved };
+  }
+
+  private getNoteType(noteData: Note): string {
+    if (noteData.type?.trim()) {
+      return noteData.type.trim();
+    }
+    return (
+      extractFrontmatterScalar(splitFrontmatter(noteData.content).frontmatter, "type") ||
+      "note"
+    );
+  }
+
+  private generateFilename(noteData: Note): string {
+    const noteId = noteData.noteId.trim();
+    const titleFallback = noteData.title?.trim()
+      ? sanitizeFilename(noteData.title)
+      : noteId;
+    const created = parseDate(noteData.createTime);
+
+    switch (this.settings.filenameFormat) {
+      case "title":
+        return titleFallback;
+      case "time":
+        return created ? sanitizeFilename(formatDate(created)) : noteId;
+      case "titleDate":
+        if (!created) return titleFallback;
+        return sanitizeFilename(
+          `${titleFallback} (${formatDate(created).slice(0, 10)})`
+        );
+      case "template": {
+        const createDate = created ? formatDate(created).slice(0, 10) : "";
+        const createTime = created
+          ? formatDate(created).slice(11).replace(/:/g, "")
+          : "";
+        const template =
+          this.settings.filenameTemplate || DEFAULT_SETTINGS.filenameTemplate;
+        return sanitizeFilename(
+          template
+            .replace(/\{\{\s*title\s*\}\}/g, noteData.title || noteId)
+            .replace(/\{\{\s*createDate\s*\}\}/g, createDate)
+            .replace(/\{\{\s*createTime\s*\}\}/g, createTime)
+            .replace(/\{\{\s*noteId\s*\}\}/g, noteId)
+        );
+      }
+      case "noteId":
+      default:
+        return noteId;
+    }
+  }
+
+  private buildDesiredHPath(noteData: Note, date: string): string {
+    const segments: string[] = [];
+    const baseHPath = resolveBaseHPath(this.settings);
+    if (baseHPath) {
+      segments.push(baseHPath.replace(/^\/+/, ""));
+    }
+
+    if (this.settings.typeFolders.enabled) {
+      const folderName =
+        categorizeType(this.getNoteType(noteData)) === "material"
+          ? this.settings.typeFolders.material
+          : this.settings.typeFolders.note;
+      segments.push(
+        sanitizeFolderSegment(folderName) ||
+          DEFAULT_SETTINGS.typeFolders.note
+      );
+    }
+
+    if (this.settings.zettelBoxFolders.enabled) {
+      const zettel = firstZettelBoxName(noteData);
+      if (zettel) {
+        segments.push(zettel);
+      }
+    }
+
+    if (this.settings.fileLayout === "nested") {
+      const safeDate = date.replace(/[^0-9-]/g, "");
+      if (safeDate) {
+        segments.push(safeDate);
+      }
+    }
+
+    segments.push(this.generateFilename(noteData));
+    return `/${segments.filter(Boolean).join("/")}`;
+  }
+
+  private withAudioFallback(content: string, audioUrl?: string): string {
+    if (!audioUrl || content.includes(audioUrl)) {
+      return content;
+    }
+    return `<audio src="${audioUrl}" controls></audio>\n\n${content}`.trim();
+  }
+
+  private buildPreview(content: string): string | undefined {
+    const raw = content || "";
+    if (!raw) {
+      return undefined;
+    }
+    const split = splitFrontmatter(raw);
+    for (const line of split.body.split(/\r?\n/)) {
+      const cleaned = line
+        .trim()
+        .replace(/^#+\s*/, "")
+        .replace(/[`*_]/g, "");
+      if (!cleaned || cleaned.startsWith(">")) {
+        continue;
+      }
+      return cleaned.length > 120 ? `${cleaned.slice(0, 117)}...` : cleaned;
+    }
+    return undefined;
+  }
+
+  private getDailyNotesNotebookId(): string {
+    return (
+      this.settings.dailyNotes.notebookId.trim() || this.settings.notebookId.trim()
+    );
+  }
+
+  private buildDailyNoteHPath(date: string): string {
+    const parsed = parseDate(`${date} 00:00:00`) || parseDate(date) || new Date();
+    const year = String(parsed.getFullYear());
+    const month = String(parsed.getMonth() + 1).padStart(2, "0");
+    const day = String(parsed.getDate()).padStart(2, "0");
+    const base = resolveBaseHPath({
+      ...this.settings,
+      basePath: this.settings.dailyNotes.basePath,
+    } as DinoPluginSettings);
+    const segments = [base.replace(/^\/+/, ""), year, month, `${year}-${month}-${day}`]
+      .filter(Boolean);
+    return `/${segments.join("/")}`;
+  }
+
+  private getDailyNoteAttrKey(date: string): string {
+    const parsed = parseDate(`${date} 00:00:00`) || parseDate(date) || new Date();
+    const year = String(parsed.getFullYear());
+    const month = String(parsed.getMonth() + 1).padStart(2, "0");
+    const day = String(parsed.getDate()).padStart(2, "0");
+    return `custom-dailynote-${year}${month}${day}`;
+  }
+
+  private renderDailyNoteSection(entries: DailyNoteChangeSet["added"]): string {
+    const heading = this.settings.dailyNotes.heading.trim();
+    const lines: string[] = [];
+    if (heading) {
+      lines.push(heading);
+    }
+    lines.push("<!-- Dinox Daily Notes -->");
+    entries.forEach((entry) => {
+      const title = (entry.title || "Untitled").replace(/'/g, "\\'");
+      const ref = entry.docId ? `((${entry.docId} '${title}'))` : title;
+      lines.push(`- ${ref} <!-- dinox-note:${entry.noteId} -->`);
+      if (this.settings.dailyNotes.includePreview && entry.preview) {
+        lines.push(`  > ${entry.preview}`);
+      }
+    });
+    lines.push("<!-- /Dinox Daily Notes -->");
+    return lines.join("\n");
+  }
+
+  private parseDailyNoteManagedEntries(content: string): DailyNoteChangeSet["added"] {
+    const entries: DailyNoteChangeSet["added"] = [];
+    const startMarker = "<!-- Dinox Daily Notes -->";
+    const endMarker = "<!-- /Dinox Daily Notes -->";
+    const start = content.indexOf(startMarker);
+    const end = content.indexOf(endMarker);
+    if (start === -1 || end === -1 || end <= start) {
+      return entries;
+    }
+    const section = content
+      .slice(start + startMarker.length, end)
+      .split(/\r?\n/);
+    for (let i = 0; i < section.length; i++) {
+      const line = section[i].trim();
+      const match = line.match(/dinox-note:([^\s>]+)\s*-->/);
+      if (!match) {
+        continue;
+      }
+      const docMatch = line.match(/\(\(([^\s)]+)(?:\s+'([^']*)')?\)\)/);
+      const titleMatch = docMatch?.[2];
+      let preview: string | undefined;
+      const nextLine = section[i + 1]?.trim();
+      if (nextLine?.startsWith(">")) {
+        preview = nextLine.replace(/^>\s?/, "");
+        i++;
+      }
+      entries.push({
+        noteId: match[1],
+        docId: docMatch?.[1],
+        title: titleMatch,
+        preview,
+      });
+    }
+    return entries;
+  }
+
+  private upsertDailyNoteContent(
+    original: string,
+    changeSet: DailyNoteChangeSet
+  ): string | null {
+    const startMarker = "<!-- Dinox Daily Notes -->";
+    const endMarker = "<!-- /Dinox Daily Notes -->";
+    const existingEntries = this.parseDailyNoteManagedEntries(original);
+    const entries = [...existingEntries];
+
+    const removed = new Set(changeSet.removed.map((item) => item.noteId));
+    const filtered = entries.filter((item) => !removed.has(item.noteId));
+
+    changeSet.added.forEach((item) => {
+      const existingIndex = filtered.findIndex((entry) => entry.noteId === item.noteId);
+      if (existingIndex >= 0) {
+        filtered[existingIndex] = {
+          ...filtered[existingIndex],
+          ...item,
+        };
+      } else if (this.settings.dailyNotes.insertTo === "top") {
+        filtered.unshift(item);
+      } else {
+        filtered.push(item);
+      }
+    });
+
+    const rendered = this.renderDailyNoteSection(filtered);
+    const start = original.indexOf(startMarker);
+    const end = original.indexOf(endMarker);
+
+    let next = original;
+    if (start !== -1 && end !== -1 && end > start) {
+      next =
+        original.slice(0, start).replace(/\s*$/, "\n\n") +
+        rendered +
+        "\n" +
+        original.slice(end + endMarker.length).replace(/^\s*/, "\n");
+    } else {
+      const prefix = original.trimEnd();
+      next = `${prefix}${prefix ? "\n\n" : ""}${rendered}\n`;
+    }
+
+    return next === original ? null : next;
+  }
+
+  private async applyDailyNoteChanges(changes: Map<string, DailyNoteChangeSet>) {
+    const notebookId = this.getDailyNotesNotebookId();
+    if (!notebookId) {
+      showMessage("已启用每日汇总，但未配置可用笔记本 ID", 4000, "error");
+      return;
+    }
+
+    let updatedCount = 0;
+    for (const [date, changeSet] of changes.entries()) {
+      if (changeSet.added.length === 0 && changeSet.removed.length === 0) {
+        continue;
+      }
+      const hPath = this.buildDailyNoteHPath(date);
+      const ids = await getIDsByHPath(notebookId, hPath);
+      let docId = ids[0];
+
+      if (!docId) {
+        if (!this.settings.dailyNotes.createIfMissing) {
+          continue;
+        }
+        docId = await createDocWithMd(notebookId, hPath, "");
+        await setBlockAttrs(docId, {
+          [this.getDailyNoteAttrKey(date)]: "true",
+        });
+      }
+
+      const exported = await exportMdContent(docId);
+      const updated = this.upsertDailyNoteContent(exported?.content || "", changeSet);
+      if (!updated) {
+        continue;
+      }
+      await updateBlock("markdown", updated, docId);
+      updatedCount++;
+    }
+
+    if (updatedCount > 0) {
+      showMessage(`已更新 ${updatedCount} 个每日汇总文档`, 4000, "info");
+    }
+  }
+
+  private async processSingleNote(
+    noteData: Note,
+    date: string,
+    localIndex: Record<string, LocalDocInfo>,
+    state: SyncState
+  ): Promise<
+    | { status: "processed"; docId: string; title: string; preview?: string }
+    | { status: "deleted"; docId?: string; title?: string }
+    | { status: "skipped" }
+  > {
+    const sourceId = (noteData.noteId || "").trim();
+    if (!sourceId) {
+      return { status: "skipped" };
+    }
+
+    let existing = localIndex[sourceId];
+    if (!existing && state.notePathById[sourceId]) {
+      const ids = await getIDsByHPath(
+        this.settings.notebookId,
+        state.notePathById[sourceId]
+      );
+      if (ids.length > 0) {
+        const id = ids[0];
+        existing = {
+          id,
+          path: await getPathByID(id),
+          hPath: state.notePathById[sourceId],
+          title: (await getBlockByID(id))?.content || "",
+          attrs: (await getBlockAttrs(id)) || {},
+        };
+        localIndex[sourceId] = existing;
+      }
+    }
+
+    if (noteData.isDel) {
+      if (!existing) {
+        delete state.notePathById[sourceId];
+        return { status: "skipped" };
+      }
+      await removeDoc(this.settings.notebookId, existing.path);
+      delete localIndex[sourceId];
+      delete state.notePathById[sourceId];
+      return { status: "deleted", docId: existing.id, title: existing.title };
+    }
+
+    const desiredHPath = this.buildDesiredHPath(noteData, date);
+    const noteContent = this.getNoteContentParts(noteData);
+    const attrs = this.buildDinoxAttrs(noteData, date, noteContent.frontmatter);
+    const rawContent = noteContent.content;
+
+    if (existing) {
+      const { ignore, preserved } = await this.readExistingDocContext(existing.id);
+      if (ignore) {
+        return { status: "skipped" };
+      }
+      const content = mergeFrontmatter(rawContent, preserved);
+      await updateBlock("markdown", content, existing.id);
+      await setBlockAttrs(existing.id, { ...existing.attrs, ...attrs });
+      state.notePathById[sourceId] = existing.hPath || desiredHPath;
+      localIndex[sourceId] = {
+        ...existing,
+        attrs: { ...existing.attrs, ...attrs },
+      };
+      return {
+        status: "processed",
+        docId: existing.id,
+        title: noteData.title || existing.title || this.generateFilename(noteData),
+        preview: this.buildPreview(content),
+      };
+    }
+
+    const desiredIds = await getIDsByHPath(this.settings.notebookId, desiredHPath);
+    if (desiredIds.length > 0) {
+      const docId = desiredIds[0];
+      const { ignore, preserved } = await this.readExistingDocContext(docId);
+      if (ignore) {
+        return { status: "skipped" };
+      }
+      const content = mergeFrontmatter(rawContent, preserved);
+      await updateBlock("markdown", content, docId);
+      await setBlockAttrs(docId, attrs);
+      const existingPath = await getPathByID(docId);
+      localIndex[sourceId] = {
+        id: docId,
+        path: existingPath,
+        hPath: desiredHPath,
+        title: noteData.title || "",
+        attrs,
+      };
+      state.notePathById[sourceId] = desiredHPath;
+      return {
+        status: "processed",
+        docId,
+        title: noteData.title || this.generateFilename(noteData),
+        preview: this.buildPreview(content),
+      };
+    }
+
+    const docId = await createDocWithMd(
+      this.settings.notebookId,
+      desiredHPath,
+      rawContent
+    );
+    await setBlockAttrs(docId, attrs);
+    localIndex[sourceId] = {
+      id: docId,
+      path: await getPathByID(docId),
+      hPath: desiredHPath,
+      title: noteData.title || "",
+      attrs,
+    };
+    state.notePathById[sourceId] = desiredHPath;
+    return {
+      status: "processed",
+      docId,
+      title: noteData.title || this.generateFilename(noteData),
+      preview: this.buildPreview(rawContent),
+    };
+  }
+
+  private async getDocPushContext(docId: string): Promise<{
+    noteId: string | null;
+    title: string;
+    tags: string[];
+    content: string;
+  }> {
+    const [attrs, exported, exportedBody, block] = await Promise.all([
+      getBlockAttrs(docId),
+      exportMdContent(docId),
+      exportMdContentWithoutFrontmatterAndTitle(docId),
+      getBlockByID(docId),
+    ]);
+
+    const markdown = exported?.content || "";
+    const split = splitFrontmatter(markdown);
+    const frontmatterNoteId =
+      extractFrontmatterScalar(split.frontmatter, "noteId") ||
+      extractFrontmatterScalar(split.frontmatter, "source_app_id");
+
+    return {
+      noteId: attrs?.["custom-dinox-note-id"] || frontmatterNoteId || null,
+      title:
+        extractFrontmatterScalar(split.frontmatter, "title") ||
+        attrs?.["custom-dinox-title"] ||
+        block?.content ||
+        "Untitled",
+      tags: Array.from(
+        new Set([
+          ...this.getStoredTagsFromAttrs(attrs || {}),
+          ...extractAllTagsFromMarkdown(markdown),
+        ])
+      ),
+      content: exportedBody?.content || "",
+    };
+  }
+
+  private async smartSyncDocToDinox(docId: string) {
+    const context = await this.getDocPushContext(docId);
+    if (context.noteId) {
+      await this.syncCurrentDocToDinox(docId);
+      return;
+    }
+    await this.createCurrentDocToDinox(docId);
+  }
+
+  private async syncCurrentDocToDinox(docId: string) {
+    if (!this.settings.token.trim()) {
+      showMessage("请先配置 Dinox Token", 3000, "error");
+      return;
+    }
+
+    try {
+      const context = await this.getDocPushContext(docId);
+      if (!context.noteId) {
+        showMessage("当前文档尚未关联 Dinox noteId", 3000, "error");
+        return;
+      }
+
+      showMessage("正在同步当前文档到 Dinox...", 3000, "info");
+      await updateDinoxNote({
+        token: this.settings.token,
+        noteId: context.noteId,
+        title: context.title,
+        tags: context.tags,
+        contentMd: context.content,
+      });
+      showMessage(
+        `同步成功：${context.noteId.substring(0, 8)}...`,
+        3000,
+        "info"
+      );
+    } catch (error) {
+      console.error("syncCurrentDocToDinox failed:", error);
+      showMessage(`同步失败：${getErrorMessage(error)}`, 6000, "error");
+    }
+  }
+
+  private async createCurrentDocToDinox(docId: string) {
+    if (!this.settings.token.trim()) {
+      showMessage("请先配置 Dinox Token", 3000, "error");
+      return;
+    }
+
+    try {
+      const context = await this.getDocPushContext(docId);
+      if (context.noteId) {
+        showMessage("当前文档已关联 Dinox noteId，请直接同步", 3000, "info");
+        return;
+      }
+
+      showMessage("正在创建到 Dinox...", 3000, "info");
+      const noteId = await createDinoxNote({
+        token: this.settings.token,
+        title: context.title,
+        tags: context.tags,
+        content: context.content,
+      });
+
+      await setBlockAttrs(docId, {
+        "custom-dinox-note-id": noteId,
+        "custom-dinox-type": "note",
+        "custom-dinox-created-at": new Date().toISOString(),
+      });
+
+      showMessage(`创建成功：${noteId.substring(0, 8)}...`, 4000, "info");
+    } catch (error) {
+      console.error("createCurrentDocToDinox failed:", error);
+      showMessage(`创建失败：${getErrorMessage(error)}`, 6000, "error");
     }
   }
 }

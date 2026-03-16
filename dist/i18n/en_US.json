@@ -1,0 +1,23 @@
+{
+    "addTopBarIcon": "Dinox Sync",
+    "cancel": "Cancel",
+    "save": "Save",
+    "byeMenu": "Bye, Menu!",
+    "helloPlugin": "Hello, Plugin!",
+    "byePlugin": "Bye, Plugin!",
+    "syncNotes": "Sync Notes",
+    "smartSync": "Smart Sync Current Document",
+    "resetSync": "Reset Sync Status",
+    "resetSyncTime": "Reset Sync Time",
+    "removedData": "Data deleted",
+    "confirmRemove": "Confirm to delete the data in ${name}?",
+    "insertEmoji": "Insert Emoji",
+    "removeSpace": "Remove Space",
+    "getTab": "Print out all opened custom tabs in the debugger",
+    "name": "Dinox Sync Plugin",
+    "hello": {
+        "makesure": "This is a plugin for syncing Dinox notes to SiYuan Note. Please configure your Dinox Token and target Notebook ID in the settings."
+    },
+    "hintTitle": "About Dinox Sync",
+    "hintDesc": "Dinox Sync Plugin v1.0<br>🔗 Sync notes with Dinox app<br>📝 Support bi-directional sync<br>⚙️ Configurable sync options"
+}
