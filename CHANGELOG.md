@@ -1,112 +1,35 @@
 # Changelog
 
-## v0.3.5 2024-04-30
+## v1.0.8 - 2026-03-26
 
-* [Add `direction` to plugin method `Setting.addItem`](https://github.com/siyuan-note/siyuan/issues/11183)
+相较于 `v1.0.4`，本次更新主要集中在同步能力、目录组织和发布稳定性上。
 
+### 用户可见更新
 
-## 0.3.4 2024-02-20
+- 新增双向同步能力：现在可以把当前思源文档直接同步回 Dinox；如果文档还没有关联 `noteId`，也可以直接创建到 Dinox。
+- 新增“发送选中文本到 Dinox”：在顶部菜单和文档标题图标菜单中，可以直接把当前选中的文本发送为一条 Dinox 笔记。
+- 同步元数据改为使用思源块属性保存：`noteId`、标题、类型、标签、创建时间、更新时间、音频地址等都写入 `custom-dinox-*` 属性，正文更干净，后续回写也更稳定。
+- 新增更灵活的同步目录规则：支持设置 Dinox 根目录、按内容类型分目录、按卡片盒分目录，以及更灵活的文件名模板。
+- 新增每日汇总文档：可选把同步到思源的 Dinox 笔记按日期汇总到每日笔记中，并支持插入摘要预览。
+- 同步链路更稳：支持增量同步状态持久化、删除同步、音频内容兜底、标签提取与保留字段合并。
 
-* [Add plugin event bus `click-flashcard-action`](https://github.com/siyuan-note/siyuan/issues/10318)
+### 内部改进
 
-## 0.3.3 2024-01-24
+- 新增自动化发版流程：`pnpm release patch|minor|major` 会自动升级版本号、校验构建、创建 release commit 和 tag。
+- GitHub Actions 会在 tag push 后自动构建 `package.zip` 并发布 GitHub Release，减少手工上传出错。
+- 发布依赖锁文件已纳入版本管理，保证 CI 构建和本地构建一致。
 
-* Update dock icon class
+### 升级说明
 
-## 0.3.2 2024-01-09
+- 旧版本已经同步到思源的文档仍可继续使用。
+- 新版本会优先从块属性中读取 Dinox 元数据；已有 front matter 中的关键信息仍会兼容读取。
+- 如果启用了新的目录规则，后续新同步的文档会按新规则落盘；建议先在测试笔记本验证目录结构是否符合预期。
 
-* [Add plugin `protyleOptions`](https://github.com/siyuan-note/siyuan/issues/10090)
-* [Add plugin api `uninstall`](https://github.com/siyuan-note/siyuan/issues/10063)
-* [Add plugin method `updateCards`](https://github.com/siyuan-note/siyuan/issues/10065)
-* [Add plugin function `lockScreen`](https://github.com/siyuan-note/siyuan/issues/10063)
-* [Add plugin event bus `lock-screen`](https://github.com/siyuan-note/siyuan/pull/9967)
-* [Add plugin event bus `open-menu-inbox`](https://github.com/siyuan-note/siyuan/pull/9967)
+## v1.0.4 - 2025-07-15
 
+### 用户可见更新
 
-## 0.3.1 2023-12-06
+- 引入双向同步基础能力。
+- 将 Dinox 元数据迁移到思源块属性中保存。
+- 支持从思源创建文档到 Dinox。
 
-* [Support `Dock Plugin` and `Command Palette` on mobile](https://github.com/siyuan-note/siyuan/issues/9926)
-
-## 0.3.0 2023-12-05
-
-* Upgrade Siyuan to 0.9.0
-* Support more platforms
-
-## 0.2.9 2023-11-28
-
-* [Add plugin method `openMobileFileById`](https://github.com/siyuan-note/siyuan/issues/9738)
-
-
-## 0.2.8 2023-11-15
-
-* [`resize` cannot be triggered after dragging to unpin the dock](https://github.com/siyuan-note/siyuan/issues/9640)
-
-## 0.2.7 2023-10-31
-
-* [Export `Constants` to plugin](https://github.com/siyuan-note/siyuan/issues/9555)
-* [Add plugin `app.appId`](https://github.com/siyuan-note/siyuan/issues/9538)
-* [Add plugin event bus `switch-protyle`](https://github.com/siyuan-note/siyuan/issues/9454)
-
-## 0.2.6 2023-10-24
-
-* [Deprecated `loaded-protyle` use `loaded-protyle-static` instead](https://github.com/siyuan-note/siyuan/issues/9468)
-
-## 0.2.5 2023-10-10
-
-* [Add plugin event bus `open-menu-doctree`](https://github.com/siyuan-note/siyuan/issues/9351)
-
-## 0.2.4 2023-09-19
-
-* Supports use in windows
-* [Add plugin function `transaction`](https://github.com/siyuan-note/siyuan/issues/9172)
-
-## 0.2.3 2023-09-05
-
-* [Add plugin function `transaction`](https://github.com/siyuan-note/siyuan/issues/9172)
-* [Plugin API add openWindow and command.globalCallback](https://github.com/siyuan-note/siyuan/issues/9032)
-
-## 0.2.2 2023-08-29
-
-* [Add plugin event bus `destroy-protyle`](https://github.com/siyuan-note/siyuan/issues/9033)
-* [Add plugin event bus `loaded-protyle-dynamic`](https://github.com/siyuan-note/siyuan/issues/9021)
-
-## 0.2.1 2023-08-21
-
-* [Plugin API add getOpenedTab method](https://github.com/siyuan-note/siyuan/issues/9002)
-* [Plugin API custom.fn => custom.id in openTab](https://github.com/siyuan-note/siyuan/issues/8944)
-
-## 0.2.0 2023-08-15
-
-* [Add plugin event bus `open-siyuan-url-plugin` and `open-siyuan-url-block`](https://github.com/siyuan-note/siyuan/pull/8927)
-
-
-## 0.1.12 2023-08-01
-
-* Upgrade siyuan to 0.7.9
-
-## 0.1.11
-
-* [Add `input-search` event bus to plugins](https://github.com/siyuan-note/siyuan/issues/8725)
-
-
-## 0.1.10
-
-* [Add `bind this` example for eventBus in plugins](https://github.com/siyuan-note/siyuan/issues/8668)
-* [Add `open-menu-breadcrumbmore` event bus to plugins](https://github.com/siyuan-note/siyuan/issues/8666)
-
-## 0.1.9
-
-* [Add `open-menu-xxx` event bus for plugins ](https://github.com/siyuan-note/siyuan/issues/8617)
-
-## 0.1.8
-
-* [Add protyleSlash to the plugin](https://github.com/siyuan-note/siyuan/issues/8599)
-* [Add plugin API protyle](https://github.com/siyuan-note/siyuan/issues/8445)
-
-## 0.1.7
-
-* [Support build js and json](https://github.com/siyuan-note/plugin-sample/pull/8)
-
-## 0.1.6
-
-* add `fetchPost` example

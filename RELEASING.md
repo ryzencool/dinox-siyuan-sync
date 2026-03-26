@@ -30,3 +30,40 @@ git push origin <branch> --follow-tags
 ```
 
 The tag push triggers `.github/workflows/release.yml`, which creates or updates the GitHub Release and uploads `package.zip`.
+
+## Release Notes Checklist
+
+Before pushing a release tag, update these user-facing docs:
+
+- `README.md`: latest release summary shown in bazaar details
+- `README_zh_CN.md`: short Chinese release summary shown to Chinese users
+- `CHANGELOG.md`: full release notes and upgrade notes
+
+## Release Notes Template
+
+Copy this into the GitHub Release description and then replace the placeholders:
+
+```md
+## 本次更新
+
+- 新增：
+- 优化：
+- 修复：
+
+## 相较上一版的主要变化
+
+- 
+- 
+- 
+
+## 升级说明
+
+- 
+- 
+
+## 使用入口
+
+- 顶部 Dinox 菜单：
+- 文档标题图标菜单：
+- 右键菜单：
+```
