@@ -1,6 +1,7 @@
 {
   "name": "dinox-siyuan-sync",
   "version": "1.0.5",
+  "packageManager": "pnpm@10.26.2",
   "type": "module",
   "description": "This is a sample plugin based on vite and svelte for Siyuan (https://b3log.org/siyuan)",
   "repository": "",
@@ -11,7 +12,11 @@
     "make-link": "node  --no-warnings ./scripts/make_dev_link.js",
     "dev": "vite build --watch",
     "build": "vite build",
-    "make-install": "vite build && node --no-warnings ./scripts/make_install.js"
+    "make-install": "vite build && node --no-warnings ./scripts/make_install.js",
+    "release": "node --no-warnings ./scripts/release.js",
+    "release:patch": "pnpm release patch",
+    "release:minor": "pnpm release minor",
+    "release:major": "pnpm release major"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^3.0.0",

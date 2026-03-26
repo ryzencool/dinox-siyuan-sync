@@ -13,9 +13,11 @@ const args = minimist(process.argv.slice(2))
 const isWatch = args.watch || args.w || false
 const devDistDir = "dev"
 const distDir = isWatch ? devDistDir : "dist"
+const packageZipOutDir = process.env.PACKAGE_ZIP_OUT_DIR || "."
 
 console.log("isWatch=>", isWatch)
 console.log("distDir=>", distDir)
+console.log("packageZipOutDir=>", packageZipOutDir)
 
 export default defineConfig({
     resolve: {
@@ -106,7 +108,7 @@ export default defineConfig({
                     ] : [
                         zipPack({
                             inDir: './dist',
-                            outDir: './',
+                            outDir: packageZipOutDir,
                             outFileName: 'package.zip'
                         })
                     ]

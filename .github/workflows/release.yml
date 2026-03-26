@@ -1,62 +1,62 @@
-name: Create Release on Tag Push
+name: Publish Release
 
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ github.ref_name }}
     steps:
-      # Checkout
       - name: Checkout
-        uses: actions/checkout@v3
-
-      # Install Node.js
-      - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/checkout@v6
         with:
-          node-version: 20
-          registry-url: "https://registry.npmjs.org"
+          fetch-depth: 0
 
-        # Install pnpm
-      - name: Install pnpm
+      - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        id: pnpm-install
         with:
-          version: 8
+          version: 10.26.2
           run_install: false
 
-      # Get pnpm store directory
-      - name: Get pnpm store directory
-        id: pnpm-cache
-        shell: bash
-        run: |
-          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
-
-      # Setup pnpm cache
-      - name: Setup pnpm cache
-        uses: actions/cache@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
-          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
+          node-version: 22
+          cache: pnpm
 
-      # Install dependencies
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
-      # Build for production, 这一步会生成一个 dinox-siyuan-sync-0.3.7.zip
-      - name: Build for production
+      - name: Build release artifact
+        env:
+          PACKAGE_ZIP_OUT_DIR: .release-artifacts
         run: pnpm build
 
-      - name: Release
-        uses: ncipollo/release-action@v1
-        with:
-          allowUpdates: true
-          artifactErrorsFailBuild: true
-          artifacts: "dinox-siyuan-sync-0.3.7.zip"
-          token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: true
+      - name: Verify release artifact
+        run: test -f .release-artifacts/package.zip
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" .release-artifacts/package.zip --clobber
+            gh release edit "$TAG_NAME" --latest
+          else
+            gh release create "$TAG_NAME" .release-artifacts/package.zip \
+              --title "$TAG_NAME" \
+              --generate-notes \
+              --verify-tag \
+              --latest
+          fi
