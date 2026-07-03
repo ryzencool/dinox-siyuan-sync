@@ -1,6 +1,9 @@
 export interface ZettelBoxRef {
   id?: string;
   name?: string;
+  /** Full hierarchical path, "/"-separated from root to leaf. */
+  path?: string;
+  // Legacy shapes kept for backward compatibility with older payloads.
   zettelBoxName?: string;
   zettelBox?: {
     name?: string;
@@ -21,9 +24,21 @@ export interface Note {
   zettelBoxes?: Array<string | ZettelBoxRef>;
 }
 
-export interface DayNote {
-  date: string;
+/** A single page of incrementally-synced notes returned by the sync endpoint. */
+export interface NotesSyncPage {
   notes: Note[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  serverTime?: string;
+}
+
+/** A card box as returned by the zettelboxes endpoint, used to build the tree. */
+export interface ZettelBoxNode {
+  id: string;
+  name: string;
+  parentId: string | null;
+  path: string | null;
+  priority: number;
 }
 
 export interface TypeFoldersSettings {
@@ -36,6 +51,12 @@ export interface ZettelBoxFoldersSettings {
   enabled: boolean;
 }
 
+export interface SyncScopeSettings {
+  /** When true, only notes in the selected boxes (and their sub-boxes) sync. */
+  enabled: boolean;
+  selectedBoxIds: string[];
+}
+
 export interface DailyNotesSettings {
   enabled: boolean;
   notebookId: string;
@@ -44,6 +65,8 @@ export interface DailyNotesSettings {
   insertTo: "top" | "bottom";
   createIfMissing: boolean;
   includePreview: boolean;
+  /** ref = SiYuan block reference ((id)); embed = block embed query. */
+  linkStyle: "ref" | "embed";
 }
 
 export interface DinoPluginSettings {
@@ -53,6 +76,7 @@ export interface DinoPluginSettings {
   basePath: string;
   typeFolders: TypeFoldersSettings;
   zettelBoxFolders: ZettelBoxFoldersSettings;
+  syncScope: SyncScopeSettings;
   template: string;
   filenameFormat: "noteId" | "title" | "time" | "titleDate" | "template";
   filenameTemplate: string;

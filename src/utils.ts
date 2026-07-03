@@ -42,6 +42,19 @@ export function normalizeDinoxDateTime(value: unknown): string {
   return parsed ? formatDate(parsed) : DEFAULT_LAST_SYNC_TIME;
 }
 
+/**
+ * Convert the stored sync cursor into an unambiguous ISO timestamp the server
+ * can compare. Returns null for a first/full sync so older stored formats can
+ * never cause a timezone-shifted query.
+ */
+export function resolveSince(stored: string | undefined): string | null {
+  if (!stored || stored === DEFAULT_LAST_SYNC_TIME) {
+    return null;
+  }
+  const parsed = parseDate(stored);
+  return parsed ? parsed.toISOString() : null;
+}
+
 export function sanitizeFilename(name: string): string {
   if (!name) return "Untitled";
   let sanitized = name.replace(/[\\/:*?"<>|#^[\]]/g, "-");
@@ -107,8 +120,18 @@ export function firstZettelBoxName(note: Note): string | null {
     if (!entry || typeof entry !== "object") {
       continue;
     }
+    // Prefer the leaf name; the folder segment is a single level, so we take
+    // the last path component when only a hierarchical path is provided.
+    const pathLeaf =
+      typeof entry.path === "string"
+        ? entry.path.split("/").filter(Boolean).pop() || ""
+        : "";
     const rawName =
-      entry.name || entry.zettelBoxName || entry.zettelBox?.name || "";
+      entry.name ||
+      entry.zettelBoxName ||
+      entry.zettelBox?.name ||
+      pathLeaf ||
+      "";
     const val = sanitizeFolderSegment(rawName);
     if (val) return val;
   }

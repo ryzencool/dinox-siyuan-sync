@@ -22,28 +22,36 @@ import {
   updateBlock,
 } from "@/api";
 import {
-  API_BASE_URL,
   DEFAULT_LAST_SYNC_TIME,
   DEFAULT_TEMPLATE_TEXT,
   SETTINGS_STORAGE_FILE,
   STORAGE_NAME,
+  SYNC_PAGE_SIZE,
   SYNC_STATE_NAME,
 } from "./constants";
-import { createDinoxNote, fetchNotesFromApi, updateDinoxNote } from "./dinox-api";
+import {
+  createDinoxNote,
+  fetchNotesPage,
+  fetchZettelBoxes,
+  updateDinoxNote,
+} from "./dinox-api";
 import {
   extractAllTagsFromMarkdown,
   extractFrontmatterScalar,
-  mergeFrontmatter,
   parseFrontmatterRecord,
   splitFrontmatter,
 } from "./markdown";
+import { renderNoteTemplate, validateTemplate } from "./template";
+import { stripQueryParamsFromImageUrls } from "./markdown-images";
 import { SettingUtils } from "./libs/setting-utils";
 import type {
   DailyNoteChangeSet,
   DinoPluginSettings,
   LocalDocInfo,
   Note,
+  NotesSyncPage,
   SyncState,
+  ZettelBoxNode,
 } from "./types/plugin";
 import {
   categorizeType,
@@ -53,6 +61,7 @@ import {
   normalizeDinoxDateTime,
   parseDate,
   resolveBaseHPath,
+  resolveSince,
   sanitizeFilename,
   sanitizeFolderSegment,
 } from "./utils";
@@ -69,6 +78,10 @@ const DEFAULT_SETTINGS: DinoPluginSettings = {
   },
   zettelBoxFolders: {
     enabled: false,
+  },
+  syncScope: {
+    enabled: false,
+    selectedBoxIds: [],
   },
   template: DEFAULT_TEMPLATE_TEXT,
   filenameFormat: "noteId",
@@ -87,6 +100,7 @@ const DEFAULT_SETTINGS: DinoPluginSettings = {
     insertTo: "bottom",
     createIfMissing: true,
     includePreview: false,
+    linkStyle: "ref",
   },
 };
 
@@ -104,6 +118,7 @@ export default class DinoxSiyuanPlugin extends Plugin {
   private isMobile = false;
   private isSyncing = false;
   private autoSyncTimer: number | null = null;
+  private cachedZettelBoxes: ZettelBoxNode[] | null = null;
   private readonly keydownHandler = this.handleWindowKeydown.bind(this);
 
   async onload() {
@@ -289,6 +304,13 @@ export default class DinoxSiyuanPlugin extends Plugin {
       zettelBoxFolders: {
         ...DEFAULT_SETTINGS.zettelBoxFolders,
         ...(loaded.zettelBoxFolders || {}),
+      },
+      syncScope: {
+        ...DEFAULT_SETTINGS.syncScope,
+        ...(loaded.syncScope || {}),
+        selectedBoxIds: Array.isArray(loaded.syncScope?.selectedBoxIds)
+          ? loaded.syncScope.selectedBoxIds
+          : [],
       },
       dailyNotes: {
         ...DEFAULT_SETTINGS.dailyNotes,
@@ -644,11 +666,41 @@ export default class DinoxSiyuanPlugin extends Plugin {
     });
 
     this.settingUtils.addItem({
+      key: "syncScopeEnabled",
+      value: this.settings.syncScope.enabled,
+      type: "checkbox",
+      title: "按卡片盒过滤同步范围",
+      description: "开启后仅同步下方选中的卡片盒（含其子卡片盒）中的笔记",
+      action: {
+        callback: async () => {
+          this.settings.syncScope.enabled = Boolean(
+            await this.settingUtils.takeAndSave("syncScopeEnabled")
+          );
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
+      key: "syncScopeBoxes",
+      value: "",
+      type: "custom",
+      title: "同步的卡片盒",
+      description: "点击刷新加载卡片盒列表，勾选需要同步的卡片盒",
+      createElement: () => this.createSyncScopeSelector(),
+      getEleVal: () => JSON.stringify(this.settings.syncScope.selectedBoxIds),
+      setEleVal: () => {
+        /* selection is persisted directly via checkbox handlers */
+      },
+    });
+
+    this.settingUtils.addItem({
       key: "ignoreSyncKey",
       value: this.settings.ignoreSyncKey,
       type: "textinput",
-      title: "忽略同步键",
-      description: "文档 frontmatter 或属性中存在该键且为 true 时跳过同步",
+      title: "忽略同步的属性名",
+      description:
+        "在文档块属性中设置 custom-<该名称>=true 即可跳过同步覆盖（默认 custom-ignore_sync）",
       action: {
         callback: async () => {
           const raw = String(
@@ -665,8 +717,9 @@ export default class DinoxSiyuanPlugin extends Plugin {
       key: "preserveKeys",
       value: this.settings.preserveKeys,
       type: "textarea",
-      title: "保留 frontmatter 键",
-      description: "逗号或换行分隔，更新本地文档时覆盖回去",
+      title: "保留的块属性",
+      description:
+        "逗号或换行分隔的属性名（自动加 custom- 前缀）。同步更新时保留这些属性不被覆盖；你手动添加的其他 custom- 属性本就会被保留",
       action: {
         callback: async () => {
           this.settings.preserveKeys = String(
@@ -681,13 +734,19 @@ export default class DinoxSiyuanPlugin extends Plugin {
       key: "template",
       value: this.settings.template,
       type: "textarea",
-      title: "Dinox 拉取模板",
-      description: `请求 ${API_BASE_URL}/openapi/v5/notes 时使用`,
+      title: "内容模板",
+      description:
+        "拉取笔记后在本地按 Mustache 语法渲染，frontmatter 会被剥离并转存为块属性，正文写入文档",
       action: {
         callback: async () => {
-          this.settings.template = String(
-            await this.settingUtils.takeAndSave("template")
-          );
+          const next = String(await this.settingUtils.takeAndSave("template"));
+          const error = validateTemplate(next);
+          if (error) {
+            showMessage(`模板语法错误：${error}`, 6000, "error");
+            this.settingUtils.set("template", this.settings.template);
+            return;
+          }
+          this.settings.template = next;
           await this.saveSettings();
         },
       },
@@ -850,6 +909,26 @@ export default class DinoxSiyuanPlugin extends Plugin {
     });
 
     this.settingUtils.addItem({
+      key: "dailyNotesLinkStyle",
+      value: this.settings.dailyNotes.linkStyle,
+      type: "select",
+      title: "链接样式",
+      description: "汇总中引用笔记的方式",
+      options: {
+        ref: "块引用 ((id))",
+        embed: "块嵌入（显示内容）",
+      },
+      action: {
+        callback: async () => {
+          this.settings.dailyNotes.linkStyle = (await this.settingUtils.takeAndSave(
+            "dailyNotesLinkStyle"
+          )) as "ref" | "embed";
+          await this.saveSettings();
+        },
+      },
+    });
+
+    this.settingUtils.addItem({
       key: "dailyNotesCreateIfMissing",
       value: this.settings.dailyNotes.createIfMissing,
       type: "checkbox",
@@ -897,15 +976,31 @@ export default class DinoxSiyuanPlugin extends Plugin {
     });
 
     this.settingUtils.addItem({
+      key: "resetRange",
+      value: "all",
+      type: "select",
+      title: "重置范围",
+      description: "选择下次同步重新拉取的时间范围",
+      options: {
+        yesterday: "昨天",
+        threeDays: "3 天前",
+        week: "1 周前",
+        month: "1 个月前",
+        all: "全部",
+      },
+    });
+
+    this.settingUtils.addItem({
       key: "resetSyncState",
       value: "",
       type: "button",
       title: "重置同步状态",
-      description: "下次同步将从起始时间重新拉取",
+      description: "按上方所选范围重置游标，下次同步将重新拉取该时间段之后的笔记",
       button: {
         label: "重置",
         callback: async () => {
-          await this.resetSyncStateWithConfirm();
+          const range = String(this.settingUtils.get("resetRange") || "all");
+          await this.resetSyncStateWithConfirm(range);
         },
       },
     });
@@ -995,7 +1090,7 @@ export default class DinoxSiyuanPlugin extends Plugin {
       const lastSyncTime =
         state.lastSyncTime === DEFAULT_LAST_SYNC_TIME
           ? "尚未同步"
-          : state.lastSyncTime;
+          : normalizeDinoxDateTime(state.lastSyncTime);
       element.innerHTML = `
         <div style="text-align:left;width:100%;">
           <div>最近同步时间：<strong>${lastSyncTime}</strong></div>
@@ -1022,16 +1117,167 @@ export default class DinoxSiyuanPlugin extends Plugin {
     }
   }
 
-  private async resetSyncStateWithConfirm() {
+  private computeResetSyncTime(range: string): string {
+    if (range === "all") {
+      return DEFAULT_LAST_SYNC_TIME;
+    }
+    const now = new Date();
+    const daysByRange: Record<string, number> = {
+      yesterday: 1,
+      threeDays: 3,
+      week: 7,
+      month: 30,
+    };
+    const days = daysByRange[range];
+    if (!days) {
+      return DEFAULT_LAST_SYNC_TIME;
+    }
+    now.setDate(now.getDate() - days);
+    return formatDate(now);
+  }
+
+  private async resetSyncStateWithConfirm(range = "all") {
+    const labels: Record<string, string> = {
+      yesterday: "昨天",
+      threeDays: "3 天前",
+      week: "1 周前",
+      month: "1 个月前",
+      all: "全部",
+    };
+    const label = labels[range] || "全部";
     confirm(
       "⚠️",
-      "确认重置同步状态吗？重置后下次会从起始时间重新拉取 Dinox 数据。",
+      `确认重置同步状态吗？重置后下次将重新拉取「${label}」之后的 Dinox 数据。`,
       async () => {
-        await this.saveSyncState(DEFAULT_SYNC_STATE);
+        const nextTime = this.computeResetSyncTime(range);
+        const state = await this.loadSyncState();
+        state.lastSyncTime = nextTime;
+        await this.saveSyncState(state);
         this.refreshSyncStatus();
         showMessage("同步状态已重置", 3000, "info");
       }
     );
+  }
+
+  private async loadZettelBoxes(force = false): Promise<ZettelBoxNode[]> {
+    if (!force && this.cachedZettelBoxes) {
+      return this.cachedZettelBoxes;
+    }
+    const boxes = await fetchZettelBoxes(this.settings.token);
+    // Stable order: hierarchical path, then priority, then name.
+    boxes.sort((a, b) => {
+      const pa = a.path || a.name;
+      const pb = b.path || b.name;
+      if (pa !== pb) {
+        return pa.localeCompare(pb);
+      }
+      if (a.priority !== b.priority) {
+        return a.priority - b.priority;
+      }
+      return a.name.localeCompare(b.name);
+    });
+    this.cachedZettelBoxes = boxes;
+    return boxes;
+  }
+
+  private createSyncScopeSelector(): HTMLElement {
+    const container = document.createElement("div");
+    container.style.width = "100%";
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "fn__flex";
+    toolbar.style.gap = "8px";
+    toolbar.style.marginBottom = "8px";
+
+    const refreshButton = document.createElement("button");
+    refreshButton.className = "b3-button b3-button--outline";
+    refreshButton.textContent = "刷新卡片盒列表";
+
+    const statusEl = document.createElement("span");
+    statusEl.className = "fn__flex-center";
+    statusEl.style.color = "var(--b3-theme-on-surface-light)";
+    statusEl.style.fontSize = "12px";
+
+    toolbar.appendChild(refreshButton);
+    toolbar.appendChild(statusEl);
+
+    const listEl = document.createElement("div");
+    listEl.style.maxHeight = "260px";
+    listEl.style.overflowY = "auto";
+    listEl.style.border = "1px solid var(--b3-theme-surface-lighter)";
+    listEl.style.borderRadius = "4px";
+    listEl.style.padding = "6px";
+
+    const renderList = (boxes: ZettelBoxNode[]) => {
+      listEl.innerHTML = "";
+      if (boxes.length === 0) {
+        listEl.innerHTML =
+          '<div style="color:var(--b3-theme-on-surface-light);font-size:12px;">没有可用的卡片盒</div>';
+        return;
+      }
+      const selected = new Set(this.settings.syncScope.selectedBoxIds);
+      boxes.forEach((box) => {
+        const depth = box.path ? box.path.split("/").filter(Boolean).length - 1 : 0;
+        const row = document.createElement("label");
+        row.className = "fn__flex";
+        row.style.alignItems = "center";
+        row.style.gap = "6px";
+        row.style.padding = "3px 0";
+        row.style.paddingLeft = `${Math.max(0, depth) * 16}px`;
+        row.style.cursor = "pointer";
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.className = "b3-switch fn__flex-center";
+        checkbox.checked = selected.has(box.id);
+        checkbox.addEventListener("change", async () => {
+          const set = new Set(this.settings.syncScope.selectedBoxIds);
+          if (checkbox.checked) {
+            set.add(box.id);
+          } else {
+            set.delete(box.id);
+          }
+          this.settings.syncScope.selectedBoxIds = Array.from(set);
+          await this.saveSettings();
+        });
+
+        const nameEl = document.createElement("span");
+        nameEl.textContent = box.name;
+
+        row.appendChild(checkbox);
+        row.appendChild(nameEl);
+        listEl.appendChild(row);
+      });
+    };
+
+    refreshButton.addEventListener("click", async () => {
+      if (!this.settings.token.trim()) {
+        showMessage("请先配置 Dinox Token", 3000, "error");
+        return;
+      }
+      statusEl.textContent = "加载中...";
+      refreshButton.disabled = true;
+      try {
+        const boxes = await this.loadZettelBoxes(true);
+        renderList(boxes);
+        statusEl.textContent = `共 ${boxes.length} 个卡片盒`;
+      } catch (error) {
+        console.error("fetchZettelBoxes failed:", error);
+        statusEl.textContent = "";
+        showMessage(`加载卡片盒失败：${getErrorMessage(error)}`, 6000, "error");
+      } finally {
+        refreshButton.disabled = false;
+      }
+    });
+
+    if (this.cachedZettelBoxes) {
+      renderList(this.cachedZettelBoxes);
+      statusEl.textContent = `共 ${this.cachedZettelBoxes.length} 个卡片盒`;
+    }
+
+    container.appendChild(toolbar);
+    container.appendChild(listEl);
+    return container;
   }
 
   private async editorTitleIconEvent({ detail }: { detail: any }) {
@@ -1197,6 +1443,17 @@ export default class DinoxSiyuanPlugin extends Plugin {
     }
   }
 
+  private deriveDateOnly(value: string): string {
+    const parsed = parseDate(value);
+    if (!parsed) {
+      return "";
+    }
+    const year = parsed.getFullYear();
+    const month = String(parsed.getMonth() + 1).padStart(2, "0");
+    const day = String(parsed.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
   private async syncNotes() {
     if (this.isSyncing) {
       showMessage("同步已在执行中", 3000, "info");
@@ -1211,68 +1468,152 @@ export default class DinoxSiyuanPlugin extends Plugin {
       return;
     }
 
+    // A broken template would silently strip content from every note this sync
+    // touches, so validate up front and abort rather than render garbage.
+    const templateError = validateTemplate(this.settings.template);
+    if (templateError) {
+      this.showSyncMessage(
+        `内容模板语法错误，已中止同步：${templateError}`,
+        8000,
+        "error"
+      );
+      return;
+    }
+
     this.isSyncing = true;
     const state = await this.loadSyncState();
-    const syncStartTime = new Date();
     let processed = 0;
     let deleted = 0;
+    let failed = 0;
+    let firstFailedNoteId = "";
     const dailyNoteChanges = new Map<string, DailyNoteChangeSet>();
 
-    this.showSyncMessage("开始同步 Dinox -> 思源...", 3000, "info");
+    this.showSyncMessage("开始同步 Dinox -> 思源...", 60000, "info");
 
     try {
-      const lastSyncTime = normalizeDinoxDateTime(state.lastSyncTime);
-      const dayNotes = await fetchNotesFromApi({
-        token: this.settings.token,
-        template: this.settings.template,
-        lastSyncTime,
-      });
+      // Resolve the incremental cursor. `since` is an unambiguous ISO timestamp;
+      // null means a first/full sync (which also skips deletions, since there is
+      // nothing local to remove yet).
+      const since = resolveSince(state.lastSyncTime);
+      const includeDeleted = since !== null;
+      // null => sync everything; array => only the selected boxes + sub-boxes.
+      const boxIds = this.settings.syncScope.enabled
+        ? this.settings.syncScope.selectedBoxIds
+        : null;
 
       const localIndex = await this.buildLocalDocIndex(this.settings.notebookId);
 
-      for (const dayData of [...dayNotes].reverse()) {
-        for (const noteData of [...dayData.notes].reverse()) {
-          const result = await this.processSingleNote(
-            noteData,
-            dayData.date,
-            localIndex,
-            state
-          );
-          if (result.status === "processed") {
-            processed++;
-            if (this.settings.dailyNotes.enabled) {
-              const changeSet =
-                dailyNoteChanges.get(dayData.date) || { added: [], removed: [] };
-              changeSet.added.push({
-                noteId: noteData.noteId,
-                docId: result.docId,
-                title: result.title,
-                preview: result.preview,
-              });
-              dailyNoteChanges.set(dayData.date, changeSet);
+      // Stream pages: fetch -> process -> release, so memory stays bounded
+      // regardless of how many notes changed.
+      let cursor: string | null = null;
+      let highWaterMark: string | null = null;
+      const seenCursors = new Set<string>();
+
+      do {
+        const page: NotesSyncPage = await fetchNotesPage({
+          token: this.settings.token,
+          since,
+          cursor,
+          limit: SYNC_PAGE_SIZE,
+          includeDeleted,
+          boxIds,
+        });
+
+        // Notes are ordered newest-first, so the very first note of the first
+        // page carries the high-water mark for the next sync.
+        if (highWaterMark === null && page.notes.length > 0) {
+          highWaterMark = page.notes[0].updateTime || null;
+        }
+
+        for (const noteData of page.notes) {
+          const date = this.deriveDateOnly(noteData.createTime);
+          try {
+            const result = await this.processSingleNote(
+              noteData,
+              date,
+              localIndex,
+              state
+            );
+            if (result.status === "processed") {
+              processed++;
+              if (this.settings.dailyNotes.enabled && date) {
+                const changeSet =
+                  dailyNoteChanges.get(date) || { added: [], removed: [] };
+                changeSet.added.push({
+                  noteId: noteData.noteId,
+                  docId: result.docId,
+                  title: result.title,
+                  preview: result.preview,
+                });
+                dailyNoteChanges.set(date, changeSet);
+              }
+            } else if (result.status === "deleted") {
+              deleted++;
+              if (this.settings.dailyNotes.enabled && date) {
+                const changeSet =
+                  dailyNoteChanges.get(date) || { added: [], removed: [] };
+                changeSet.removed.push({
+                  noteId: noteData.noteId,
+                  docId: result.docId,
+                  title: result.title,
+                });
+                dailyNoteChanges.set(date, changeSet);
+              }
             }
-          }
-          if (result.status === "deleted") {
-            deleted++;
-            if (this.settings.dailyNotes.enabled) {
-              const changeSet =
-                dailyNoteChanges.get(dayData.date) || { added: [], removed: [] };
-              changeSet.removed.push({
-                noteId: noteData.noteId,
-                docId: result.docId,
-                title: result.title,
-              });
-              dailyNoteChanges.set(dayData.date, changeSet);
+          } catch (noteError) {
+            failed++;
+            if (!firstFailedNoteId) {
+              firstFailedNoteId = noteData.noteId;
             }
+            console.error(
+              `Dinox: 处理笔记失败 ${noteData.noteId}:`,
+              noteError
+            );
           }
         }
+
+        const nextCursor = page.nextCursor;
+        if (page.hasMore && !nextCursor) {
+          throw new Error("同步响应标记有更多分页，但未返回 nextCursor");
+        }
+        if (nextCursor) {
+          if (seenCursors.has(nextCursor)) {
+            throw new Error("同步分页返回了重复的游标");
+          }
+          seenCursors.add(nextCursor);
+        }
+        cursor = page.hasMore ? nextCursor : null;
+        if (cursor) {
+          this.showSyncMessage(
+            `同步中...（已处理 ${processed} 条）`,
+            60000,
+            "info"
+          );
+          // Breathe between pages so the UI stays responsive.
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        }
+      } while (cursor);
+
+      // Any per-note failure means we must NOT advance the cursor, or we would
+      // permanently skip the failed notes on the next incremental sync.
+      if (failed > 0) {
+        throw new Error(
+          `${failed} 条笔记处理失败，同步游标未推进（首个失败：${firstFailedNoteId.substring(
+            0,
+            8
+          )}）`
+        );
       }
 
       if (this.settings.dailyNotes.enabled) {
         await this.applyDailyNoteChanges(dailyNoteChanges);
       }
 
-      state.lastSyncTime = formatDate(syncStartTime);
+      // Persist only on success. Advance the cursor only if we saw notes;
+      // otherwise keep the previous high-water mark.
+      if (highWaterMark) {
+        state.lastSyncTime = highWaterMark;
+      }
       await this.saveSyncState(state);
       this.refreshSyncStatus();
       this.showSyncMessage(
@@ -1281,6 +1622,7 @@ export default class DinoxSiyuanPlugin extends Plugin {
         "info"
       );
     } catch (error) {
+      // Do NOT advance lastSyncTime on error.
       console.error("Dinox sync failed:", error);
       this.showSyncMessage(`同步失败：${getErrorMessage(error)}`, 8000, "error");
     } finally {
@@ -1388,7 +1730,12 @@ export default class DinoxSiyuanPlugin extends Plugin {
     body: string;
     content: string;
   } {
-    const split = splitFrontmatter(noteData.content || "");
+    // The sync API returns compact structured data; render the user's Mustache
+    // template client-side, then split off the frontmatter so document metadata
+    // lives in SiYuan block attributes and only the body is written to the doc.
+    const rendered = renderNoteTemplate(this.settings.template, noteData);
+    const cleaned = stripQueryParamsFromImageUrls(rendered).content;
+    const split = splitFrontmatter(cleaned);
     const content = this.withAudioFallback(split.body, noteData.audioUrl);
     return {
       frontmatter: split.frontmatter,
@@ -1423,31 +1770,25 @@ export default class DinoxSiyuanPlugin extends Plugin {
     return attrs;
   }
 
-  private async readExistingDocContext(docId: string): Promise<{
+  // SiYuan has no frontmatter — document metadata lives in block attributes
+  // (IAL). Both "ignore sync" and "preserve" are resolved purely from the
+  // block's `custom-*` attributes, so nothing is ever written into the body.
+  private readExistingDocContext(attrs: Record<string, string>): {
     ignore: boolean;
-    preserved: Record<string, string | boolean | string[]>;
-  }> {
-    const [attrs, exported] = await Promise.all([
-      getBlockAttrs(docId),
-      exportMdContent(docId),
-    ]);
-
-    const split = splitFrontmatter(exported?.content || "");
-    const parsed = parseFrontmatterRecord(split.frontmatter);
+    preserved: Record<string, string>;
+  } {
     const ignoreKey = this.settings.ignoreSyncKey;
-    const attrIgnore =
-      attrs?.[ignoreKey] || attrs?.[`custom-${ignoreKey}`] || "";
-    const frontmatterIgnore = parsed[ignoreKey];
-    const ignore =
-      attrIgnore === "true" ||
-      attrIgnore === "1" ||
-      frontmatterIgnore === true ||
-      frontmatterIgnore === "true";
+    const ignoreVal =
+      attrs[`custom-${ignoreKey}`] ?? attrs[ignoreKey] ?? "";
+    const ignore = ignoreVal === "true" || ignoreVal === "1";
 
-    const preserved: Record<string, string | boolean | string[]> = {};
+    // Protect user-added attributes from being reset by sync. Keys are matched
+    // against the `custom-` prefixed attribute name (auto-prefixed if omitted).
+    const preserved: Record<string, string> = {};
     for (const key of this.getPreserveKeys()) {
-      if (parsed[key] !== undefined) {
-        preserved[key] = parsed[key];
+      const attrName = key.startsWith("custom-") ? key : `custom-${key}`;
+      if (attrs[attrName] !== undefined) {
+        preserved[attrName] = attrs[attrName];
       }
     }
     return { ignore, preserved };
@@ -1591,6 +1932,28 @@ export default class DinoxSiyuanPlugin extends Plugin {
     return `custom-dailynote-${year}${month}${day}`;
   }
 
+  // Encode all entry metadata into a trailing HTML comment so parsing is
+  // independent of the visible link style (block ref vs embed). Fields are
+  // URI-encoded so titles/previews can contain any character except the
+  // reserved "|" separator and newlines.
+  private renderManagedEntryLine(entry: DailyNoteChangeSet["added"][number]): string {
+    const title = entry.title || "Untitled";
+    const docId = entry.docId || "";
+    let visible: string;
+    if (this.settings.dailyNotes.linkStyle === "embed" && docId) {
+      visible = `{{select * from blocks where id='${docId}'}}`;
+    } else if (docId) {
+      const safeTitle = title.replace(/'/g, "\\'");
+      visible = `- ((${docId} '${safeTitle}'))`;
+    } else {
+      visible = `- ${title}`;
+    }
+    const meta = `dinox:${entry.noteId}|${docId}|${encodeURIComponent(
+      title
+    )}|${encodeURIComponent(entry.preview || "")}`;
+    return `${visible} <!-- ${meta} -->`;
+  }
+
   private renderDailyNoteSection(entries: DailyNoteChangeSet["added"]): string {
     const heading = this.settings.dailyNotes.heading.trim();
     const lines: string[] = [];
@@ -1599,9 +1962,7 @@ export default class DinoxSiyuanPlugin extends Plugin {
     }
     lines.push("<!-- Dinox Daily Notes -->");
     entries.forEach((entry) => {
-      const title = (entry.title || "Untitled").replace(/'/g, "\\'");
-      const ref = entry.docId ? `((${entry.docId} '${title}'))` : title;
-      lines.push(`- ${ref} <!-- dinox-note:${entry.noteId} -->`);
+      lines.push(this.renderManagedEntryLine(entry));
       if (this.settings.dailyNotes.includePreview && entry.preview) {
         lines.push(`  > ${entry.preview}`);
       }
@@ -1624,12 +1985,27 @@ export default class DinoxSiyuanPlugin extends Plugin {
       .split(/\r?\n/);
     for (let i = 0; i < section.length; i++) {
       const line = section[i].trim();
-      const match = line.match(/dinox-note:([^\s>]+)\s*-->/);
-      if (!match) {
+
+      // Current format: metadata packed into the trailing comment.
+      const metaMatch = line.match(
+        /dinox:([^|]*)\|([^|]*)\|([^|]*)\|([^\s]*)\s*-->/
+      );
+      if (metaMatch) {
+        entries.push({
+          noteId: metaMatch[1],
+          docId: metaMatch[2] || undefined,
+          title: decodeURIComponent(metaMatch[3] || "") || undefined,
+          preview: decodeURIComponent(metaMatch[4] || "") || undefined,
+        });
+        continue;
+      }
+
+      // Legacy format (<= v1.0.10): `((id 'title')) <!-- dinox-note:ID -->`.
+      const legacy = line.match(/dinox-note:([^\s>]+)\s*-->/);
+      if (!legacy) {
         continue;
       }
       const docMatch = line.match(/\(\(([^\s)]+)(?:\s+'([^']*)')?\)\)/);
-      const titleMatch = docMatch?.[2];
       let preview: string | undefined;
       const nextLine = section[i + 1]?.trim();
       if (nextLine?.startsWith(">")) {
@@ -1637,9 +2013,9 @@ export default class DinoxSiyuanPlugin extends Plugin {
         i++;
       }
       entries.push({
-        noteId: match[1],
+        noteId: legacy[1],
         docId: docMatch?.[1],
-        title: titleMatch,
+        title: docMatch?.[2],
         preview,
       });
     }
@@ -1782,50 +2158,53 @@ export default class DinoxSiyuanPlugin extends Plugin {
     const rawContent = noteContent.content;
 
     if (existing) {
-      const { ignore, preserved } = await this.readExistingDocContext(existing.id);
+      const { ignore, preserved } = this.readExistingDocContext(existing.attrs);
       if (ignore) {
         return { status: "skipped" };
       }
-      const content = mergeFrontmatter(rawContent, preserved);
-      await updateBlock("markdown", content, existing.id);
-      await setBlockAttrs(existing.id, { ...existing.attrs, ...attrs });
+      // Body-only write; metadata stays in attributes. `preserved` re-applies
+      // any protected user attributes over the freshly-built dinox attrs.
+      const nextAttrs = { ...attrs, ...preserved };
+      await updateBlock("markdown", rawContent, existing.id);
+      await setBlockAttrs(existing.id, nextAttrs);
       state.notePathById[sourceId] = existing.hPath || desiredHPath;
       localIndex[sourceId] = {
         ...existing,
-        attrs: { ...existing.attrs, ...attrs },
+        attrs: { ...existing.attrs, ...nextAttrs },
       };
       return {
         status: "processed",
         docId: existing.id,
         title: noteData.title || existing.title || this.generateFilename(noteData),
-        preview: this.buildPreview(content),
+        preview: this.buildPreview(rawContent),
       };
     }
 
     const desiredIds = await getIDsByHPath(this.settings.notebookId, desiredHPath);
     if (desiredIds.length > 0) {
       const docId = desiredIds[0];
-      const { ignore, preserved } = await this.readExistingDocContext(docId);
+      const docAttrs = (await getBlockAttrs(docId)) || {};
+      const { ignore, preserved } = this.readExistingDocContext(docAttrs);
       if (ignore) {
         return { status: "skipped" };
       }
-      const content = mergeFrontmatter(rawContent, preserved);
-      await updateBlock("markdown", content, docId);
-      await setBlockAttrs(docId, attrs);
+      const nextAttrs = { ...attrs, ...preserved };
+      await updateBlock("markdown", rawContent, docId);
+      await setBlockAttrs(docId, nextAttrs);
       const existingPath = await getPathByID(docId);
       localIndex[sourceId] = {
         id: docId,
         path: existingPath,
         hPath: desiredHPath,
         title: noteData.title || "",
-        attrs,
+        attrs: { ...docAttrs, ...nextAttrs },
       };
       state.notePathById[sourceId] = desiredHPath;
       return {
         status: "processed",
         docId,
         title: noteData.title || this.generateFilename(noteData),
-        preview: this.buildPreview(content),
+        preview: this.buildPreview(rawContent),
       };
     }
 
